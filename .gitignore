@@ -1,0 +1,6 @@
+node_modules/
+data/
+.test-tmp/
+*.db*
+.env*
+.DS_Store
