@@ -8,9 +8,13 @@ import { runBenchmark } from "./benchmark.ts";
 import { runCli } from "./cli.ts";
 import { compileContext } from "./compiler.ts";
 import { GraphStore } from "./graph-store.ts";
-import { ContextGraphMcpSession, MCP_TOOLS, startMcpStdioServer } from "./mcp.ts";
-import { createContextGraphServer, type ContextGraphServerInstance } from "./server.ts";
-import { CycleDetectedError, NotFoundError } from "./types.ts";
+import { ContextGraphMcpSession, handleMcpJsonRpc, MCP_TOOLS, startMcpStdioServer } from "./mcp.ts";
+import {
+  createContextGraphServer,
+  isLoopbackHost,
+  type ContextGraphServerInstance,
+} from "./server.ts";
+import { ContextGraphError, CycleDetectedError, NotFoundError } from "./types.ts";
 import {
   cosineSimilarity,
   countTokens,
@@ -769,5 +773,465 @@ describe("CLI & 32-Turn Comparative Benchmark Suite", () => {
       `Expected CG effectiveCostIndex (${cg.effectiveCostIndex}) < 60 vs Sliding=100`,
     );
     assert.ok(cg.effectiveCostIndex < rag.effectiveCostIndex);
+  });
+});
+
+describe("Bearer Auth, Fail-Closed Protection & Streamable HTTP /mcp", () => {
+  it("24. refuses to start on non-loopback hosts without >=16-char authToken (fail-closed)", async () => {
+    // Verify loopback host classification
+    assert.equal(isLoopbackHost("127.0.0.1"), true);
+    assert.equal(isLoopbackHost("::1"), true);
+    assert.equal(isLoopbackHost("localhost"), true);
+    assert.equal(isLoopbackHost("LOCALHOST"), true);
+    assert.equal(isLoopbackHost("100.108.223.41"), false);
+    assert.equal(isLoopbackHost("0.0.0.0"), false);
+    assert.equal(isLoopbackHost("::"), false);
+    assert.equal(isLoopbackHost("127.0.0.2"), false);
+    assert.equal(isLoopbackHost(""), false);
+
+    // Non-loopback host without authToken must reject with ContextGraphError
+    const noTokenApp = createContextGraphServer({ dataPath: ":memory:", authToken: "" });
+    try {
+      await assert.rejects(
+        () => noTokenApp.start(0, "100.108.223.41"),
+        (err: unknown) =>
+          err instanceof ContextGraphError && err.code === "INSECURE_BIND_REFUSED",
+      );
+      await assert.rejects(
+        () => noTokenApp.start(0, "0.0.0.0"),
+        (err: unknown) =>
+          err instanceof ContextGraphError && err.code === "INSECURE_BIND_REFUSED",
+      );
+    } finally {
+      await noTokenApp.close();
+    }
+
+    // Non-loopback host with <16-char authToken must reject without leaking token
+    const shortSecret = "short-token-15c";
+    assert.equal(shortSecret.length, 15);
+    const shortTokenApp = createContextGraphServer({
+      dataPath: ":memory:",
+      authToken: shortSecret,
+    });
+    try {
+      await assert.rejects(
+        () => shortTokenApp.start(0, "100.108.223.41"),
+        (err: unknown) =>
+          err instanceof ContextGraphError &&
+          err.code === "INSECURE_BIND_REFUSED" &&
+          !err.message.includes(shortSecret),
+      );
+    } finally {
+      await shortTokenApp.close();
+    }
+
+    // Whitespace-only >=16-char token trims to empty and must also be rejected
+    const blankTokenApp = createContextGraphServer({
+      dataPath: ":memory:",
+      authToken: "                    ",
+    });
+    try {
+      await assert.rejects(
+        () => blankTokenApp.start(0, "100.108.223.41"),
+        ContextGraphError,
+      );
+    } finally {
+      await blankTokenApp.close();
+    }
+
+    // Verify CG_AUTH_TOKEN env var pickup & CLI fail-closed non-leakage
+    const prevToken = process.env.CG_AUTH_TOKEN;
+    try {
+      process.env.CG_AUTH_TOKEN = "env_secret_token_9876543210";
+      const envApp = createContextGraphServer({ dataPath: ":memory:", port: 0 });
+      try {
+        const bound = await envApp.start(0, "127.0.0.1");
+        const unauthRes = await fetch(`${bound.url}/v1/graphs`);
+        assert.equal(unauthRes.status, 401);
+        const okRes = await fetch(`${bound.url}/v1/graphs`, {
+          headers: { Authorization: "Bearer env_secret_token_9876543210" },
+        });
+        assert.equal(okRes.status, 200);
+      } finally {
+        await envApp.close();
+      }
+
+      const leakedSecret = "tiny_secret_123";
+      process.env.CG_AUTH_TOKEN = leakedSecret;
+      let cliOut = "";
+      let cliErr = "";
+      await assert.rejects(
+        () =>
+          runCli(["serve", "--host", "100.108.223.41", "--port", "0", "--db", ":memory:"], {
+            stdout: (s) => { cliOut += s; },
+            stderr: (s) => { cliErr += s; },
+          }),
+        (err: unknown) =>
+          err instanceof ContextGraphError && !err.message.includes(leakedSecret),
+      );
+      assert.ok(!cliOut.includes(leakedSecret));
+      assert.ok(!cliErr.includes(leakedSecret));
+    } finally {
+      if (prevToken === undefined) {
+        delete process.env.CG_AUTH_TOKEN;
+      } else {
+        process.env.CG_AUTH_TOKEN = prevToken;
+      }
+    }
+  });
+
+  it("25. enforces Bearer token auth on /v1/* and /mcp and splits minimal vs full /health", async () => {
+    const token = "cg_bearer_secret_token_2026_tailscale";
+    const app = createContextGraphServer({
+      dataPath: ":memory:",
+      port: 0,
+      authToken: token,
+    });
+    const bound = await app.start(0, "127.0.0.1");
+    const authHeaders = { Authorization: `Bearer ${token}` };
+
+    try {
+      // Unauthenticated GET /health returns ONLY minimal fields
+      const healthNoAuth = await fetch(`${bound.url}/health`);
+      assert.equal(healthNoAuth.status, 200);
+      const healthNoAuthBody = (await healthNoAuth.json()) as Record<string, unknown>;
+      assert.deepEqual(healthNoAuthBody, {
+        ok: true,
+        service: "context-graph",
+        version: "0.1.0",
+      });
+      assert.equal("dbPath" in healthNoAuthBody, false);
+      assert.equal("graphsCount" in healthNoAuthBody, false);
+
+      // Wrong token on GET /health also returns ONLY minimal fields
+      const healthWrongAuth = await fetch(`${bound.url}/health`, {
+        headers: { Authorization: "Bearer wrong_token_value_1234567890" },
+      });
+      assert.equal(healthWrongAuth.status, 200);
+      const healthWrongBody = (await healthWrongAuth.json()) as Record<string, unknown>;
+      assert.deepEqual(healthWrongBody, {
+        ok: true,
+        service: "context-graph",
+        version: "0.1.0",
+      });
+
+      // Valid Bearer token on GET /health returns full metadata & stats
+      const healthAuthed = await fetch(`${bound.url}/health`, { headers: authHeaders });
+      assert.equal(healthAuthed.status, 200);
+      const healthAuthedBody = (await healthAuthed.json()) as Record<string, unknown>;
+      assert.equal(healthAuthedBody.ok, true);
+      assert.equal(healthAuthedBody.service, "context-graph");
+      assert.equal(healthAuthedBody.version, "0.1.0");
+      assert.equal(healthAuthedBody.dbPath, ":memory:");
+      assert.equal(typeof healthAuthedBody.uptimeSec, "number");
+      assert.equal(healthAuthedBody.graphsCount, 0);
+      assert.equal(healthAuthedBody.nodesCount, 0);
+      assert.equal(healthAuthedBody.edgesCount, 0);
+
+      // /v1/graphs: missing token & wrong token (different/same length) -> 401
+      const expected401 = {
+        ok: false,
+        error: {
+          code: "UNAUTHORIZED",
+          message: "Valid Bearer token required",
+        },
+      };
+
+      const graphsNoAuth = await fetch(`${bound.url}/v1/graphs`);
+      assert.equal(graphsNoAuth.status, 401);
+      assert.deepEqual(await graphsNoAuth.json(), expected401);
+
+      const graphsShortWrong = await fetch(`${bound.url}/v1/graphs`, {
+        headers: { Authorization: "Bearer short" },
+      });
+      assert.equal(graphsShortWrong.status, 401);
+      assert.deepEqual(await graphsShortWrong.json(), expected401);
+
+      const graphsSameLenWrong = await fetch(`${bound.url}/v1/graphs`, {
+        headers: { Authorization: "Bearer cg_bearer_secret_token_2026_tailscalX" },
+      });
+      assert.equal(graphsSameLenWrong.status, 401);
+      assert.deepEqual(await graphsSameLenWrong.json(), expected401);
+
+      // /v1/graphs with valid Bearer token -> 200
+      const graphsAuthed = await fetch(`${bound.url}/v1/graphs`, { headers: authHeaders });
+      assert.equal(graphsAuthed.status, 200);
+      assert.deepEqual(await graphsAuthed.json(), { ok: true, graphs: [] });
+
+      // /mcp: missing or wrong token -> 401 across POST/GET/DELETE
+      const mcpPostNoAuth = await fetch(`${bound.url}/mcp`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }),
+      });
+      assert.equal(mcpPostNoAuth.status, 401);
+      assert.deepEqual(await mcpPostNoAuth.json(), expected401);
+
+      const mcpPostWrongAuth = await fetch(`${bound.url}/mcp`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer invalid_mcp_token",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }),
+      });
+      assert.equal(mcpPostWrongAuth.status, 401);
+      assert.deepEqual(await mcpPostWrongAuth.json(), expected401);
+
+      const mcpGetNoAuth = await fetch(`${bound.url}/mcp`, { method: "GET" });
+      assert.equal(mcpGetNoAuth.status, 401);
+
+      const mcpDeleteNoAuth = await fetch(`${bound.url}/mcp`, { method: "DELETE" });
+      assert.equal(mcpDeleteNoAuth.status, 401);
+
+      // /mcp with valid Bearer token succeeds
+      const mcpPingAuthed = await fetch(`${bound.url}/mcp`, {
+        method: "POST",
+        headers: { ...authHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: "p1", method: "ping" }),
+      });
+      assert.equal(mcpPingAuthed.status, 200);
+      assert.deepEqual(await mcpPingAuthed.json(), { jsonrpc: "2.0", id: "p1", result: {} });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("26. completes Streamable HTTP /mcp handshake, tools/call workflow, batch, GET 405, and DELETE 200", async () => {
+    const token = "cg_streamable_mcp_token_2026_secure";
+    const app = createContextGraphServer({
+      dataPath: ":memory:",
+      port: 0,
+      authToken: token,
+    });
+    const bound = await app.start(0, "127.0.0.1");
+    const baseHeaders = {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      Accept: "application/json, text/event-stream",
+    };
+
+    try {
+      // 1. POST /mcp initialize -> 200 + Mcp-Session-Id header
+      const initRes = await fetch(`${bound.url}/mcp`, {
+        method: "POST",
+        headers: baseHeaders,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-03-26",
+            capabilities: {},
+            clientInfo: { name: "streamable-http-test", version: "1.0.0" },
+          },
+        }),
+      });
+      assert.equal(initRes.status, 200);
+      assert.match(initRes.headers.get("content-type") ?? "", /^application\/json\b/i);
+      const sessionId = initRes.headers.get("mcp-session-id");
+      assert.ok(sessionId && sessionId.length > 0, "Expected Mcp-Session-Id header on initialize");
+
+      const initBody = (await initRes.json()) as {
+        jsonrpc: string;
+        id: number;
+        result: { protocolVersion: string; serverInfo: { name: string } };
+      };
+      assert.equal(initBody.jsonrpc, "2.0");
+      assert.equal(initBody.id, 1);
+      assert.equal(initBody.result.protocolVersion, "2025-03-26");
+      assert.equal(initBody.result.serverInfo.name, "@opc/context-graph");
+
+      const sessionHeaders = {
+        ...baseHeaders,
+        "Mcp-Session-Id": sessionId,
+      };
+
+      // 2. POST /mcp notifications/initialized -> 202 Accepted with empty body
+      const notifRes = await fetch(`${bound.url}/mcp`, {
+        method: "POST",
+        headers: sessionHeaders,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          method: "notifications/initialized",
+        }),
+      });
+      assert.equal(notifRes.status, 202);
+      assert.equal(await notifRes.text(), "");
+
+      // 3. POST /mcp tools/list -> 200 with all 6 tools
+      const listRes = await fetch(`${bound.url}/mcp`, {
+        method: "POST",
+        headers: sessionHeaders,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/list",
+        }),
+      });
+      assert.equal(listRes.status, 200);
+      const listBody = (await listRes.json()) as {
+        result: { tools: Array<{ name: string }> };
+      };
+      assert.equal(listBody.result.tools.length, 6);
+      assert.ok(listBody.result.tools.some((t) => t.name === "cg_create_graph"));
+      assert.ok(listBody.result.tools.some((t) => t.name === "cg_ingest_turn"));
+      assert.ok(listBody.result.tools.some((t) => t.name === "cg_compile_context"));
+
+      // 4. POST /mcp tools/call -> cg_create_graph
+      const createRes = await fetch(`${bound.url}/mcp`, {
+        method: "POST",
+        headers: sessionHeaders,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 3,
+          method: "tools/call",
+          params: {
+            name: "cg_create_graph",
+            arguments: {
+              id: "http_mcp_g1",
+              name: "Streamable HTTP MCP Graph",
+              defaultBudget: 1600,
+            },
+          },
+        }),
+      });
+      assert.equal(createRes.status, 200);
+      const createBody = (await createRes.json()) as {
+        result: { isError: boolean; structuredContent: { ok: boolean; graph: { id: string } } };
+      };
+      assert.equal(createBody.result.isError, false);
+      assert.equal(createBody.result.structuredContent.ok, true);
+      assert.equal(createBody.result.structuredContent.graph.id, "http_mcp_g1");
+
+      // 5. POST /mcp tools/call -> cg_ingest_turn
+      const ingestRes = await fetch(`${bound.url}/mcp`, {
+        method: "POST",
+        headers: sessionHeaders,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 4,
+          method: "tools/call",
+          params: {
+            name: "cg_ingest_turn",
+            arguments: {
+              graphId: "http_mcp_g1",
+              turn: 1,
+              scope: "deploy",
+              system: "You are a Tailscale deployment assistant.",
+              goal: "Expose Context Graph over Tailscale on Ubuntu1.",
+              constraints: ["Must require CG_AUTH_TOKEN on non-loopback hosts."],
+              artifacts: [
+                {
+                  path: "deploy/context-graph.env",
+                  content: "HOST=100.108.223.41\nPORT=52341\n",
+                },
+              ],
+            },
+          },
+        }),
+      });
+      assert.equal(ingestRes.status, 200);
+      const ingestBody = (await ingestRes.json()) as {
+        result: { isError: boolean; structuredContent: { addedNodes: unknown[] } };
+      };
+      assert.equal(ingestBody.result.isError, false);
+      assert.ok(ingestBody.result.structuredContent.addedNodes.length >= 4);
+
+      // 6. POST /mcp tools/call -> cg_compile_context (verify non-empty compiled output)
+      const compileRes = await fetch(`${bound.url}/mcp`, {
+        method: "POST",
+        headers: sessionHeaders,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 5,
+          method: "tools/call",
+          params: {
+            name: "cg_compile_context",
+            arguments: {
+              graphId: "http_mcp_g1",
+              focusQuery: "Ubuntu1 Tailscale HOST and CG_AUTH_TOKEN",
+              activeScope: "deploy",
+            },
+          },
+        }),
+      });
+      assert.equal(compileRes.status, 200);
+      const compileBody = (await compileRes.json()) as {
+        result: {
+          isError: boolean;
+          structuredContent: {
+            ok: boolean;
+            promptText: string;
+            messages: Array<{ role: string; content: string }>;
+            kvCache: { totalTokens: number };
+          };
+        };
+      };
+      assert.equal(compileBody.result.isError, false);
+      assert.equal(compileBody.result.structuredContent.ok, true);
+      assert.ok(compileBody.result.structuredContent.promptText.length > 0);
+      assert.ok(compileBody.result.structuredContent.promptText.includes("100.108.223.41"));
+      assert.ok(compileBody.result.structuredContent.messages.length >= 2);
+      assert.ok(compileBody.result.structuredContent.kvCache.totalTokens > 0);
+
+      // 7. JSON-RPC batch (mixed request + notification -> 200 array; notifications-only -> 202)
+      const batchMixedRes = await fetch(`${bound.url}/mcp`, {
+        method: "POST",
+        headers: sessionHeaders,
+        body: JSON.stringify([
+          { jsonrpc: "2.0", id: "b-1", method: "ping" },
+          { jsonrpc: "2.0", method: "notifications/cancelled" },
+        ]),
+      });
+      assert.equal(batchMixedRes.status, 200);
+      assert.deepEqual(await batchMixedRes.json(), [{ jsonrpc: "2.0", id: "b-1", result: {} }]);
+
+      const batchNotifRes = await fetch(`${bound.url}/mcp`, {
+        method: "POST",
+        headers: sessionHeaders,
+        body: JSON.stringify([{ jsonrpc: "2.0", method: "notifications/initialized" }]),
+      });
+      assert.equal(batchNotifRes.status, 202);
+      assert.equal(await batchNotifRes.text(), "");
+
+      // Invalid JSON on POST /mcp -> 400 JSON-RPC Parse error
+      const badJsonRes = await fetch(`${bound.url}/mcp`, {
+        method: "POST",
+        headers: sessionHeaders,
+        body: "{bad-json",
+      });
+      assert.equal(badJsonRes.status, 400);
+      const badJsonBody = (await badJsonRes.json()) as { error: { code: number } };
+      assert.equal(badJsonBody.error.code, -32700);
+
+      // Direct unit check on handleMcpJsonRpc export (single & batch)
+      const directBatch = handleMcpJsonRpc(app.store, [
+        { jsonrpc: "2.0", id: "d1", method: "ping" },
+        { jsonrpc: "2.0", method: "notifications/custom" },
+      ]);
+      assert.deepEqual(directBatch, [{ jsonrpc: "2.0", id: "d1", result: {} }]);
+
+      // 8. GET /mcp -> 405 Method Not Allowed with Allow: POST, DELETE
+      const getMcpRes = await fetch(`${bound.url}/mcp`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      assert.equal(getMcpRes.status, 405);
+      assert.equal(getMcpRes.headers.get("allow"), "POST, DELETE");
+
+      // 9. DELETE /mcp -> 200 OK { ok: true }
+      const delMcpRes = await fetch(`${bound.url}/mcp`, {
+        method: "DELETE",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Mcp-Session-Id": sessionId,
+        },
+      });
+      assert.equal(delMcpRes.status, 200);
+      assert.deepEqual(await delMcpRes.json(), { ok: true });
+    } finally {
+      await app.close();
+    }
   });
 });

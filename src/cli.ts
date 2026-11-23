@@ -13,7 +13,7 @@ Usage:
   context-graph <command> [options]
 
 Commands:
-  serve       Start the HTTP REST microservice (default 127.0.0.1:52341)
+  serve       Start the HTTP REST & Streamable HTTP MCP (/mcp) service (default 127.0.0.1:52341)
   mcp         Start the JSON-RPC 2.0 MCP Server over stdio
   benchmark   Run the 32-turn multi-file engineering agent benchmark
   demo        Run a live multi-turn Context Graph compilation & Mermaid demo
@@ -25,6 +25,12 @@ Options:
   --budget-ratio <ratio>  Token budget ratio vs full linear history for benchmark (default: 0.4)
   --json                  Emit machine-readable JSON output
   -h, --help              Show this help message
+
+Environment:
+  HOST                    HTTP listen host (default: 127.0.0.1)
+  PORT                    HTTP listen port (default: 52341)
+  DATA_PATH               SQLite database path (default: data/context-graph.db)
+  CG_AUTH_TOKEN           Bearer token for /v1/*, /mcp, and full /health stats (required, >=16 chars for non-loopback HOST)
 `;
 
 export interface CliIo {
@@ -60,24 +66,33 @@ export async function runCli(
   }
 
   const dbPath =
-    typeof values.db === "string"
-      ? values.db
-      : process.env.DATA_PATH ?? "data/context-graph.db";
+    typeof values.db === "string" && values.db.trim().length > 0
+      ? values.db.trim()
+      : process.env.DATA_PATH?.trim() || "data/context-graph.db";
 
   if (cmd === "serve") {
+    const rawPort =
+      typeof values.port === "string" && values.port.trim().length > 0
+        ? values.port.trim()
+        : process.env.PORT?.trim();
     const port =
-      typeof values.port === "string"
-        ? Number.parseInt(values.port, 10)
-        : process.env.PORT
-          ? Number.parseInt(process.env.PORT, 10)
-          : DEFAULT_PORT;
+      rawPort && rawPort.length > 0 ? Number.parseInt(rawPort, 10) : DEFAULT_PORT;
     const host =
-      typeof values.host === "string" ? values.host : process.env.HOST ?? DEFAULT_HOST;
+      typeof values.host === "string" && values.host.trim().length > 0
+        ? values.host.trim()
+        : process.env.HOST?.trim() || DEFAULT_HOST;
+    const authToken = process.env.CG_AUTH_TOKEN?.trim() || undefined;
 
-    const app = createContextGraphServer({ dataPath: dbPath, host, port });
-    const bound = await app.start(port, host);
+    const app = createContextGraphServer({ dataPath: dbPath, host, port, authToken });
+    let bound: { host: string; port: number; url: string };
+    try {
+      bound = await app.start(port, host);
+    } catch (err) {
+      await app.close();
+      throw err;
+    }
     writeOut(
-      `[context-graph] HTTP service listening on ${bound.url} (db=${app.store.dbPath})\n`,
+      `[context-graph] HTTP service listening on ${bound.url} (db=${app.store.dbPath}, auth=${authToken ? "bearer" : "none"}, mcp=/mcp)\n`,
     );
 
     await new Promise<void>((resolveStop) => {

@@ -13,6 +13,11 @@ import {
 } from "./types.ts";
 
 export const MCP_PROTOCOL_VERSION = "2024-11-05" as const;
+export const SUPPORTED_MCP_PROTOCOL_VERSIONS = [
+  "2025-06-18",
+  "2025-03-26",
+  "2024-11-05",
+] as const;
 
 export interface JsonRpcRequest {
   jsonrpc: "2.0";
@@ -163,9 +168,42 @@ export class ContextGraphMcpSession {
     this.store = store;
   }
 
+  handlePayload(payload: unknown): JsonRpcResponse | JsonRpcResponse[] | null {
+    if (Array.isArray(payload)) {
+      if (payload.length === 0) {
+        return {
+          jsonrpc: "2.0",
+          id: null,
+          error: { code: -32600, message: "Invalid JSON-RPC 2.0 request" },
+        };
+      }
+      const responses = payload
+        .map((item) => this.handleMessage(item as JsonRpcRequest))
+        .filter((r): r is JsonRpcResponse => r !== null);
+      return responses.length > 0 ? responses : null;
+    }
+    return this.handleMessage(payload as JsonRpcRequest);
+  }
+
   handleMessage(req: JsonRpcRequest): JsonRpcResponse | null {
+    if (!req || typeof req !== "object" || Array.isArray(req)) {
+      return {
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32600, message: "Invalid JSON-RPC 2.0 request" },
+      };
+    }
+
     const isNotification = req.id === undefined;
     const id = req.id ?? null;
+
+    if (
+      req.jsonrpc === "2.0" &&
+      req.method === undefined &&
+      ("result" in req || "error" in req)
+    ) {
+      return null;
+    }
 
     if (req.jsonrpc !== "2.0" || typeof req.method !== "string") {
       return {
@@ -176,17 +214,26 @@ export class ContextGraphMcpSession {
     }
 
     try {
-      if (req.method === "notifications/initialized" || req.method === "notifications/cancelled") {
+      if (req.method.startsWith("notifications/")) {
         return null;
       }
 
       if (req.method === "initialize") {
         if (isNotification) return null;
+        const requestedVersion =
+          typeof req.params?.protocolVersion === "string"
+            ? req.params.protocolVersion
+            : undefined;
+        const negotiatedVersion =
+          requestedVersion &&
+          (SUPPORTED_MCP_PROTOCOL_VERSIONS as readonly string[]).includes(requestedVersion)
+            ? requestedVersion
+            : MCP_PROTOCOL_VERSION;
         return {
           jsonrpc: "2.0",
           id,
           result: {
-            protocolVersion: MCP_PROTOCOL_VERSION,
+            protocolVersion: negotiatedVersion,
             capabilities: {
               tools: { listChanged: false },
             },
@@ -310,6 +357,18 @@ export class ContextGraphMcpSession {
 }
 
 /**
+ * Stateless helper to execute a single JSON-RPC 2.0 MCP request or batch array
+ * against a GraphStore. Returns `null` when all requests are notifications.
+ */
+export function handleMcpJsonRpc(
+  store: GraphStore,
+  req: unknown,
+): JsonRpcResponse | JsonRpcResponse[] | null {
+  const session = new ContextGraphMcpSession(store);
+  return session.handlePayload(req);
+}
+
+/**
  * Starts JSON-RPC 2.0 MCP Server over stdio (supports newline-delimited JSON
  * as well as Content-Length framed messages).
  */
@@ -330,7 +389,7 @@ export function startMcpStdioServer(options?: {
   let buffer = Buffer.alloc(0);
   let useContentLengthFraming = false;
 
-  const writeResponse = (resp: JsonRpcResponse) => {
+  const writeResponse = (resp: JsonRpcResponse | JsonRpcResponse[]) => {
     const serialized = JSON.stringify(resp);
     if (useContentLengthFraming) {
       const byteLen = Buffer.byteLength(serialized, "utf8");
@@ -355,17 +414,7 @@ export function startMcpStdioServer(options?: {
       return;
     }
 
-    if (Array.isArray(parsed)) {
-      const responses = parsed
-        .map((item) => session.handleMessage(item as JsonRpcRequest))
-        .filter((r): r is JsonRpcResponse => r !== null);
-      if (responses.length > 0) {
-        output.write(`${JSON.stringify(responses)}\n`);
-      }
-      return;
-    }
-
-    const resp = session.handleMessage(parsed as JsonRpcRequest);
+    const resp = session.handlePayload(parsed);
     if (resp) writeResponse(resp);
   };
 

@@ -1,8 +1,10 @@
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { runBenchmark } from "./benchmark.ts";
 import { compileContext } from "./compiler.ts";
 import { GraphStore } from "./graph-store.ts";
+import { handleMcpJsonRpc, type JsonRpcResponse } from "./mcp.ts";
 import {
   ContextGraphError,
   type AddEdgeInput,
@@ -17,15 +19,19 @@ export const SERVICE_NAME = "context-graph" as const;
 export const SERVICE_VERSION = "0.1.0" as const;
 export const DEFAULT_HOST = "127.0.0.1" as const;
 export const DEFAULT_PORT = 52341 as const;
+export const MIN_AUTH_TOKEN_LENGTH = 16 as const;
 
 const MAX_BODY_BYTES = 2_097_152; // 2 MiB
 const LOCAL_CORS_ORIGIN_RE = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i;
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
+const SAFE_SESSION_ID_RE = /^[\x21-\x7e]{1,128}$/;
 
 export interface ContextGraphServerOptions {
   store?: GraphStore;
   dataPath?: string;
   host?: string;
   port?: number;
+  authToken?: string;
 }
 
 export interface ContextGraphServerInstance {
@@ -35,7 +41,76 @@ export interface ContextGraphServerInstance {
   close: () => Promise<void>;
 }
 
-async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+export function isLoopbackHost(host: string): boolean {
+  return LOOPBACK_HOSTS.has(host.trim().toLowerCase());
+}
+
+function sha256Digest(value: string): Buffer {
+  return createHash("sha256").update(value).digest();
+}
+
+function extractBearerToken(req: IncomingMessage): string | null {
+  const header = req.headers.authorization;
+  if (typeof header !== "string") return null;
+  const match = header.trim().match(/^Bearer\s+(.+)$/i);
+  if (!match) return null;
+  const token = match[1]!.trim();
+  return token.length > 0 ? token : null;
+}
+
+function verifyBearerToken(req: IncomingMessage, expectedDigest: Buffer): boolean {
+  const candidate = extractBearerToken(req);
+  if (!candidate) return false;
+  const candidateDigest = sha256Digest(candidate);
+  return (
+    candidateDigest.length === expectedDigest.length &&
+    timingSafeEqual(candidateDigest, expectedDigest)
+  );
+}
+
+function resolveSessionId(req: IncomingMessage): string {
+  const raw = req.headers["mcp-session-id"];
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (SAFE_SESSION_ID_RE.test(trimmed)) {
+      return trimmed;
+    }
+  }
+  return randomUUID();
+}
+
+function hasSuccessfulInitialize(
+  payload: unknown,
+  rpcResult: JsonRpcResponse | JsonRpcResponse[],
+): boolean {
+  if (!Array.isArray(payload) && !Array.isArray(rpcResult)) {
+    return (
+      payload !== null &&
+      typeof payload === "object" &&
+      (payload as Record<string, unknown>).method === "initialize" &&
+      rpcResult.error === undefined
+    );
+  }
+  if (Array.isArray(payload) && Array.isArray(rpcResult)) {
+    const initIds = new Set<string | number | null>();
+    for (const item of payload) {
+      if (
+        item !== null &&
+        typeof item === "object" &&
+        !Array.isArray(item) &&
+        (item as Record<string, unknown>).method === "initialize" &&
+        (item as Record<string, unknown>).id !== undefined
+      ) {
+        initIds.add(((item as Record<string, unknown>).id as string | number | null) ?? null);
+      }
+    }
+    if (initIds.size === 0) return false;
+    return rpcResult.some((r) => initIds.has(r.id) && r.error === undefined);
+  }
+  return false;
+}
+
+async function readRawBody(req: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of req) {
@@ -46,8 +121,12 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
     }
     chunks.push(buf);
   }
-  if (total === 0) return {};
-  const raw = Buffer.concat(chunks).toString("utf8").trim();
+  if (total === 0) return "";
+  return Buffer.concat(chunks).toString("utf8").trim();
+}
+
+async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const raw = await readRawBody(req);
   if (!raw) return {};
   try {
     const parsed = JSON.parse(raw) as unknown;
@@ -61,18 +140,46 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
   }
 }
 
-function sendJson(res: ServerResponse, statusCode: number, body: unknown, origin?: string): void {
+function sendJson(
+  res: ServerResponse,
+  statusCode: number,
+  body: unknown,
+  origin?: string,
+  extraHeaders?: Record<string, string | number>,
+): void {
   const payload = JSON.stringify(body);
   const headers: Record<string, string | number> = {
     "Content-Type": "application/json; charset=utf-8",
     "Content-Length": Buffer.byteLength(payload),
+    ...extraHeaders,
+  };
+  if (origin && LOCAL_CORS_ORIGIN_RE.test(origin)) {
+    headers["Access-Control-Allow-Origin"] = origin;
+    headers["Vary"] = "Origin";
+    if (extraHeaders && "Mcp-Session-Id" in extraHeaders) {
+      headers["Access-Control-Expose-Headers"] = "Mcp-Session-Id";
+    }
+  }
+  res.writeHead(statusCode, headers);
+  res.end(payload);
+}
+
+function sendNoBody(
+  res: ServerResponse,
+  statusCode: number,
+  origin?: string,
+  extraHeaders?: Record<string, string | number>,
+): void {
+  const headers: Record<string, string | number> = {
+    "Content-Length": 0,
+    ...extraHeaders,
   };
   if (origin && LOCAL_CORS_ORIGIN_RE.test(origin)) {
     headers["Access-Control-Allow-Origin"] = origin;
     headers["Vary"] = "Origin";
   }
   res.writeHead(statusCode, headers);
-  res.end(payload);
+  res.end();
 }
 
 function sendText(res: ServerResponse, statusCode: number, text: string, origin?: string): void {
@@ -94,10 +201,14 @@ export function createContextGraphServer(
   const ownsStore = !options.store;
   const dataPath =
     options.dataPath ??
-    process.env.DATA_PATH ??
-    "data/context-graph.db";
+    (process.env.DATA_PATH?.trim() || "data/context-graph.db");
   const store = options.store ?? new GraphStore(dataPath);
   const startedAtMs = Date.now();
+  const authToken =
+    options.authToken !== undefined
+      ? options.authToken.trim() || undefined
+      : process.env.CG_AUTH_TOKEN?.trim() || undefined;
+  const authTokenDigest = authToken ? sha256Digest(authToken) : null;
 
   const server = createServer(async (req, res) => {
     const origin = req.headers.origin;
@@ -106,7 +217,8 @@ export function createContextGraphServer(
     if (method === "OPTIONS") {
       const headers: Record<string, string> = {
         "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        "Access-Control-Allow-Headers":
+          "Content-Type, Authorization, Mcp-Session-Id, MCP-Protocol-Version",
       };
       if (origin && LOCAL_CORS_ORIGIN_RE.test(origin)) {
         headers["Access-Control-Allow-Origin"] = origin;
@@ -118,10 +230,24 @@ export function createContextGraphServer(
 
     const parsedUrl = new URL(req.url ?? "/", "http://127.0.0.1");
     const pathname = parsedUrl.pathname.replace(/\/+$/, "") || "/";
+    const isAuthorized = authTokenDigest === null || verifyBearerToken(req, authTokenDigest);
 
     try {
       // GET /health
       if (method === "GET" && pathname === "/health") {
+        if (!isAuthorized) {
+          sendJson(
+            res,
+            200,
+            {
+              ok: true,
+              service: SERVICE_NAME,
+              version: SERVICE_VERSION,
+            },
+            origin,
+          );
+          return;
+        }
         const counts = store.countsSummary();
         sendJson(
           res,
@@ -135,6 +261,100 @@ export function createContextGraphServer(
             ...counts,
           },
           origin,
+        );
+        return;
+      }
+
+      // Require valid Bearer token on all other endpoints when authToken is configured
+      if (!isAuthorized) {
+        sendJson(
+          res,
+          401,
+          {
+            ok: false,
+            error: {
+              code: "UNAUTHORIZED",
+              message: "Valid Bearer token required",
+            },
+          },
+          origin,
+          { "WWW-Authenticate": "Bearer" },
+        );
+        return;
+      }
+
+      // Streamable HTTP MCP endpoint: /mcp
+      if (pathname === "/mcp") {
+        if (method === "POST") {
+          const rawBody = await readRawBody(req);
+          if (!rawBody) {
+            sendJson(
+              res,
+              400,
+              { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } },
+              origin,
+            );
+            return;
+          }
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(rawBody);
+          } catch {
+            sendJson(
+              res,
+              400,
+              { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } },
+              origin,
+            );
+            return;
+          }
+          const rpcResult = handleMcpJsonRpc(store, parsed);
+          if (rpcResult === null) {
+            sendNoBody(res, 202, origin);
+            return;
+          }
+          const extraHeaders: Record<string, string> = {};
+          if (hasSuccessfulInitialize(parsed, rpcResult)) {
+            extraHeaders["Mcp-Session-Id"] = resolveSessionId(req);
+          }
+          sendJson(res, 200, rpcResult, origin, extraHeaders);
+          return;
+        }
+
+        if (method === "GET") {
+          sendJson(
+            res,
+            405,
+            {
+              ok: false,
+              error: {
+                code: "METHOD_NOT_ALLOWED",
+                message: "GET /mcp SSE stream is not supported; use POST /mcp",
+              },
+            },
+            origin,
+            { Allow: "POST, DELETE" },
+          );
+          return;
+        }
+
+        if (method === "DELETE") {
+          sendJson(res, 200, { ok: true }, origin);
+          return;
+        }
+
+        sendJson(
+          res,
+          405,
+          {
+            ok: false,
+            error: {
+              code: "METHOD_NOT_ALLOWED",
+              message: `Method ${method} is not allowed on /mcp`,
+            },
+          },
+          origin,
+          { Allow: "POST, DELETE" },
         );
         return;
       }
@@ -275,31 +495,49 @@ export function createContextGraphServer(
     }
   });
 
-  const defaultHost = options.host ?? process.env.HOST ?? DEFAULT_HOST;
+  const defaultHost = options.host ?? (process.env.HOST?.trim() || DEFAULT_HOST);
+  const rawEnvPort = process.env.PORT?.trim();
   const defaultPort =
     options.port ??
-    (process.env.PORT ? Number.parseInt(process.env.PORT, 10) : DEFAULT_PORT);
+    (rawEnvPort && rawEnvPort.length > 0 ? Number.parseInt(rawEnvPort, 10) : DEFAULT_PORT);
 
   return {
     server,
     store,
-    start: (port = defaultPort, host = defaultHost) =>
-      new Promise((resolveStart, rejectStart) => {
+    start: (port = defaultPort, host = defaultHost) => {
+      const hostToBind = host.trim();
+      if (!isLoopbackHost(hostToBind) && (!authToken || authToken.length < MIN_AUTH_TOKEN_LENGTH)) {
+        return Promise.reject(
+          new ContextGraphError(
+            `Refusing to start on non-loopback host "${hostToBind}" without authToken (CG_AUTH_TOKEN) of at least ${MIN_AUTH_TOKEN_LENGTH} characters`,
+            "INSECURE_BIND_REFUSED",
+            400,
+          ),
+        );
+      }
+      if (!Number.isInteger(port) || port < 0 || port > 65535) {
+        return Promise.reject(
+          new ContextGraphError(`Invalid listen port: ${port}`, "INVALID_PORT", 400),
+        );
+      }
+      return new Promise((resolveStart, rejectStart) => {
         const onError = (err: Error) => {
           server.off("error", onError);
           rejectStart(err);
         };
         server.once("error", onError);
-        server.listen(port, host, () => {
+        server.listen(port, hostToBind, () => {
           server.off("error", onError);
           const addr = server.address() as AddressInfo;
+          const formattedHost = addr.family === "IPv6" ? `[${addr.address}]` : addr.address;
           resolveStart({
             host: addr.address,
             port: addr.port,
-            url: `http://${addr.address}:${addr.port}`,
+            url: `http://${formattedHost}:${addr.port}`,
           });
         });
-      }),
+      });
+    },
     close: () =>
       new Promise((resolveClose, rejectClose) => {
         const finalize = () => {
