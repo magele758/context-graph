@@ -152,6 +152,7 @@ export class GraphStore {
   readonly dbPath: string;
   private readonly db: DatabaseSync;
   private closed = false;
+  private txDepth = 0;
 
   constructor(dbPath = ":memory:") {
     this.dbPath = dbPath === ":memory:" ? ":memory:" : resolve(dbPath);
@@ -294,16 +295,57 @@ export class GraphStore {
     };
   }
 
-  private runInTransaction<T>(fn: () => T): T {
-    this.db.exec("BEGIN IMMEDIATE");
+  /**
+   * Executes `fn` inside a single atomic SQLite transaction (`BEGIN IMMEDIATE` /
+   * `COMMIT` / `ROLLBACK`). Supports safe re-entrant nested calls via SQLite
+   * `SAVEPOINT`s so callers can batch multi-write workflows without issuing
+   * nested `BEGIN IMMEDIATE` errors or per-statement WAL fsyncs.
+   */
+  runInTransaction<T>(fn: () => T): T {
+    if (this.txDepth === 0) {
+      this.db.exec("BEGIN IMMEDIATE");
+      this.txDepth = 1;
+      try {
+        const result = fn();
+        this.db.exec("COMMIT");
+        return result;
+      } catch (err) {
+        try {
+          this.db.exec("ROLLBACK");
+        } catch {
+          // Ignore rollback errors if SQLite already aborted the transaction
+        }
+        throw err;
+      } finally {
+        this.txDepth = 0;
+      }
+    }
+
+    const spName = `cg_sp_${this.txDepth}`;
+    this.txDepth++;
+    this.db.exec(`SAVEPOINT ${spName}`);
     try {
       const result = fn();
-      this.db.exec("COMMIT");
+      this.db.exec(`RELEASE SAVEPOINT ${spName}`);
       return result;
     } catch (err) {
-      this.db.exec("ROLLBACK");
+      try {
+        this.db.exec(`ROLLBACK TO SAVEPOINT ${spName}`);
+        this.db.exec(`RELEASE SAVEPOINT ${spName}`);
+      } catch {
+        // Ignore savepoint cleanup errors if outer transaction was aborted
+      }
       throw err;
+    } finally {
+      this.txDepth--;
     }
+  }
+
+  hasGraph(graphId: string): boolean {
+    const row = this.db
+      .prepare("SELECT 1 FROM graphs WHERE id = ?")
+      .get(graphId);
+    return Boolean(row);
   }
 
   private ensureGraphExists(graphId: string): GraphRecord {

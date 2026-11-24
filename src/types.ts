@@ -403,6 +403,8 @@ export interface IngestArtifactsOptions {
   machineId?: string;
   maxCodeExcerptChars?: number;
   maxCommandExcerptChars?: number;
+  autoCreate?: boolean;
+  graphName?: string;
 }
 
 export interface IngestArtifactsResult {

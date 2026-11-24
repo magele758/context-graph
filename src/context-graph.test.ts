@@ -3730,3 +3730,357 @@ describe("v0.2.4 Chained Partial-Edit Accumulation, In-Place Merge & Tight-Diff 
     );
   });
 });
+
+describe("v0.2.5 Single-Transaction Batching & Atomic autoCreate Suite", () => {
+  it("63. supports atomic autoCreate on POST /v1/graphs/:id/ingest-artifacts & MCP, validates inputs, and preserves 404 default", async () => {
+    const token = "cg_v25_autocreate_bearer_secret";
+    const app = createContextGraphServer({ dataPath: ":memory:", port: 0, authToken: token });
+    const bound = await app.start(0, "127.0.0.1");
+    const authHeaders = {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    };
+
+    const sampleEvents: ToolTrajectoryEvent[] = [
+      {
+        callId: "ac_1",
+        tool: "read_file",
+        args: { path: "src/router.ts" },
+        ok: true,
+        output: "export const MAX_RETRIES = 2;\nexport function routeReq(p: string) { return p; }",
+      },
+      {
+        callId: "ac_2",
+        tool: "edit_file",
+        args: {
+          path: "src/router.ts",
+          old_string: "export const MAX_RETRIES = 2;",
+          new_string: "export const MAX_RETRIES = 5;",
+        },
+        ok: true,
+        output: "Edited src/router.ts",
+      },
+      {
+        callId: "ac_3",
+        tool: "bash",
+        args: { command: "npm test" },
+        ok: false,
+        output: "FAIL src/router.test.ts\nError [ERR_ROUTE_CAP]: retry ceiling exceeded\n  at routeReq (src/router.ts:2:10)",
+      },
+    ];
+
+    try {
+      // 1. Omitted autoCreate on missing graph -> 404 NOT_FOUND (100% backward compatible)
+      const omitRes = await fetch(`${bound.url}/v1/graphs/missing_omit/ingest-artifacts`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ events: sampleEvents }),
+      });
+      assert.equal(omitRes.status, 404);
+      const omitJson = (await omitRes.json()) as { ok: boolean; error: { code: string } };
+      assert.equal(omitJson.ok, false);
+      assert.equal(omitJson.error.code, "NOT_FOUND");
+
+      // 2. Explicit autoCreate: false on missing graph -> 404 NOT_FOUND
+      const falseRes = await fetch(`${bound.url}/v1/graphs/missing_false/ingest-artifacts`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ autoCreate: false, events: sampleEvents }),
+      });
+      assert.equal(falseRes.status, 404);
+
+      // 3. Invalid autoCreate / graphName -> 400 VALIDATION_ERROR
+      const badAutoRes = await fetch(`${bound.url}/v1/graphs/missing_bad/ingest-artifacts`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ autoCreate: "yes", events: sampleEvents }),
+      });
+      assert.equal(badAutoRes.status, 400);
+      const badAutoJson = (await badAutoRes.json()) as { error: { code: string } };
+      assert.equal(badAutoJson.error.code, "VALIDATION_ERROR");
+
+      const badNameEmpty = await fetch(`${bound.url}/v1/graphs/missing_bad/ingest-artifacts`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ autoCreate: true, graphName: "   ", events: sampleEvents }),
+      });
+      assert.equal(badNameEmpty.status, 400);
+
+      const badNameLong = await fetch(`${bound.url}/v1/graphs/missing_bad/ingest-artifacts`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ autoCreate: true, graphName: "x".repeat(121), events: sampleEvents }),
+      });
+      assert.equal(badNameLong.status, 400);
+
+      // 4. Valid autoCreate: true creates missing graph + ingests + compiles in ONE single HTTP call
+      const okRes1 = await fetch(`${bound.url}/v1/graphs/sess_auto_1/ingest-artifacts`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          autoCreate: true,
+          graphName: "Auto Session One",
+          events: sampleEvents,
+          prune: true,
+          compile: true,
+          compileOptions: { format: "compact_markdown", maxOutputChars: 720 },
+        }),
+      });
+      assert.equal(okRes1.status, 200);
+      const body1 = (await okRes1.json()) as {
+        ok: boolean;
+        graphId: string;
+        ingested: { ingestedCount: number; skippedCount: number };
+        compiled?: { promptText: string };
+      };
+      assert.equal(body1.ok, true);
+      assert.equal(body1.graphId, "sess_auto_1");
+      assert.equal(body1.ingested.ingestedCount, 3);
+      assert.ok(body1.compiled?.promptText.includes("MAX_RETRIES = 5"));
+      assert.ok(body1.compiled?.promptText.includes("ERR_ROUTE_CAP"));
+      assert.ok(!body1.compiled?.promptText.includes("MAX_RETRIES = 2"));
+
+      // Verify graph persisted with expected graphName
+      const snapRes = await fetch(`${bound.url}/v1/graphs/sess_auto_1`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      assert.equal(snapRes.status, 200);
+      const snap = (await snapRes.json()) as {
+        ok: boolean;
+        graph: { id: string; name: string };
+        nodes: Array<{ id: string }>;
+      };
+      assert.equal(snap.graph.id, "sess_auto_1");
+      assert.equal(snap.graph.name, "Auto Session One");
+      assert.equal(snap.nodes.length, 3);
+
+      // 5. Idempotent on second call with autoCreate: true
+      const okRes2 = await fetch(`${bound.url}/v1/graphs/sess_auto_1/ingest-artifacts`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          autoCreate: true,
+          graphName: "Auto Session One",
+          events: sampleEvents,
+        }),
+      });
+      assert.equal(okRes2.status, 200);
+      const body2 = (await okRes2.json()) as {
+        ingested: { ingestedCount: number; skippedCount: number };
+      };
+      assert.equal(body2.ingested.ingestedCount, 0);
+      assert.equal(body2.ingested.skippedCount, 3);
+
+      // 6. MCP cg_ingest_artifacts also supports autoCreate with default graphName fallback
+      const mcpRes = await fetch(`${bound.url}/mcp`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 99,
+          method: "tools/call",
+          params: {
+            name: "cg_ingest_artifacts",
+            arguments: {
+              graphId: "mcp_auto_graph",
+              autoCreate: true,
+              events: [sampleEvents[0]!],
+            },
+          },
+        }),
+      });
+      assert.equal(mcpRes.status, 200);
+      const mcpBody = (await mcpRes.json()) as {
+        result: { isError?: boolean; content: Array<{ text: string }> };
+      };
+      assert.equal(mcpBody.result.isError, false);
+      const parsedMcp = JSON.parse(mcpBody.result.content[0]!.text) as {
+        ok: boolean;
+        ingested: { ingestedCount: number };
+      };
+      assert.equal(parsedMcp.ok, true);
+      assert.equal(parsedMcp.ingested.ingestedCount, 1);
+
+      const mcpSnapRes = await fetch(`${bound.url}/v1/graphs/mcp_auto_graph`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      assert.equal(mcpSnapRes.status, 200);
+      const mcpSnap = (await mcpSnapRes.json()) as { graph: { name: string } };
+      assert.equal(mcpSnap.graph.name, "mcp_auto_graph");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("64. batches 20-event disk-SQLite ingestion into a single atomic transaction (< 25ms) with full rollback on failure", () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "cg-v25-tx-"));
+    const dbPath = join(tmpDir, "context-graph-v25.sqlite");
+
+    const buildBatch = (prefix: string): ToolTrajectoryEvent[] => {
+      const batch: ToolTrajectoryEvent[] = [];
+      for (let i = 0; i < 6; i++) {
+        batch.push({
+          callId: `${prefix}_r_${i}`,
+          tool: "read_file",
+          args: { path: `src/mod_${i}.ts` },
+          ok: true,
+          output: `export const VAL_${i} = ${i * 10};\nexport function fn_${i}(x: number) { return x + VAL_${i}; }\n`,
+        });
+      }
+      for (let i = 0; i < 6; i++) {
+        batch.push({
+          callId: `${prefix}_e_${i}`,
+          tool: "edit_file",
+          args: {
+            path: `src/mod_${i}.ts`,
+            old_string: `export const VAL_${i} = ${i * 10};`,
+            new_string: `export const VAL_${i} = ${i * 10 + 1};`,
+          },
+          ok: true,
+          output: `Edited src/mod_${i}.ts`,
+        });
+      }
+      for (let i = 0; i < 4; i++) {
+        batch.push({
+          callId: `${prefix}_w_${i}`,
+          tool: "write_file",
+          args: {
+            path: `src/mod_${i}.ts`,
+            content: `export const VAL_${i} = ${i * 10 + 2};\nexport function fn_${i}(x: number) { return x + VAL_${i}; }\n`,
+          },
+          ok: true,
+          output: `Wrote src/mod_${i}.ts`,
+        });
+      }
+      batch.push(
+        {
+          callId: `${prefix}_g_1`,
+          tool: "grep_search",
+          args: { query: "VAL_5", path: "src" },
+          ok: true,
+          output: "src/mod_5.ts:1:export const VAL_5 = 51;",
+        },
+        {
+          callId: `${prefix}_g_2`,
+          tool: "grep_search",
+          args: { query: "VAL_4", path: "src" },
+          ok: true,
+          output: "src/mod_4.ts:1:export const VAL_4 = 41;",
+        },
+        {
+          callId: `${prefix}_cmd_1`,
+          tool: "bash",
+          args: { command: "npm test" },
+          ok: false,
+          output: "FAIL src/mod_5.test.ts\nError [ERR_VAL_MISMATCH]: expected 52\n  at fn_5 (src/mod_5.ts:2:12)",
+        },
+        {
+          callId: `${prefix}_cmd_2`,
+          tool: "bash",
+          args: { command: "npm run lint" },
+          ok: true,
+          output: "Lint passed (0 warnings)",
+        },
+      );
+      return batch;
+    };
+
+    const events20 = buildBatch("perf");
+    assert.equal(events20.length, 20);
+
+    let store: GraphStore | undefined;
+    try {
+      store = new GraphStore(dbPath);
+
+      // Warm SQLite page cache / WAL file creation once
+      store.createGraph({ id: "g_warmup", name: "Warmup" });
+
+      // Measure 20-event real on-disk single-transaction ingestion + atomic autoCreate
+      const t0 = Date.now();
+      const res = ingestToolArtifacts(store, "g_disk_perf", events20, {
+        autoCreate: true,
+        graphName: "Disk Perf Batch",
+      });
+      const elapsedMs = Date.now() - t0;
+
+      assert.equal(res.ingestedCount, 20);
+      assert.equal(res.skippedCount, 0);
+      assert.ok(
+        elapsedMs < 25,
+        `Expected single-transaction 20-event disk-SQLite batch < 25ms, got ${elapsedMs}ms`,
+      );
+
+      // Verify nested SAVEPOINT rollback inside outer runInTransaction preserves outer work
+      store.runInTransaction(() => {
+        store!.createGraph({ id: "g_outer_ok", name: "Outer OK" });
+        assert.throws(() => {
+          store!.runInTransaction(() => {
+            store!.createGraph({ id: "g_inner_rolled_back", name: "Inner Fail" });
+            throw new Error("inner_savepoint_abort");
+          });
+        }, /inner_savepoint_abort/);
+      });
+      assert.equal(store.hasGraph("g_outer_ok"), true, "Outer transaction must commit cleanly");
+      assert.equal(store.hasGraph("g_inner_rolled_back"), false, "Inner savepoint must roll back cleanly");
+
+      // Verify atomic rollback of ingestToolArtifacts on injected mid-batch failure
+      const origAddNode = store.addNode.bind(store);
+      let callCount = 0;
+      store.addNode = ((graphId, input) => {
+        callCount++;
+        if (callCount === 11) {
+          throw new Error("injected_mid_batch_failure");
+        }
+        return origAddNode(graphId, input);
+      }) as typeof store.addNode;
+
+      // Case A: autoCreate on missing graph -> rolls back BOTH nodes AND newly created graph!
+      assert.throws(() => {
+        ingestToolArtifacts(store!, "g_atomic_rollback_new", buildBatch("rb_new"), {
+          autoCreate: true,
+          graphName: "Should Roll Back",
+        });
+      }, /injected_mid_batch_failure/);
+      assert.equal(
+        store.hasGraph("g_atomic_rollback_new"),
+        false,
+        "Failed autoCreate ingestion must roll back the auto-created graph atomically",
+      );
+
+      // Case B: existing empty graph -> rolls back all 10 inserted nodes + edges!
+      store.createGraph({ id: "g_atomic_rollback_existing", name: "Existing Empty" });
+      callCount = 0;
+      assert.throws(() => {
+        ingestToolArtifacts(store!, "g_atomic_rollback_existing", buildBatch("rb_ex"));
+      }, /injected_mid_batch_failure/);
+      assert.equal(
+        store.listNodes("g_atomic_rollback_existing").length,
+        0,
+        "Failed batch must leave zero partial nodes",
+      );
+      assert.equal(
+        store.listEdges("g_atomic_rollback_existing").length,
+        0,
+        "Failed batch must leave zero partial edges",
+      );
+
+      // Restore addNode and confirm txDepth cleanly recovered for subsequent writes
+      store.addNode = origAddNode;
+      const recovered = ingestToolArtifacts(store, "g_atomic_rollback_existing", buildBatch("rec"));
+      assert.equal(recovered.ingestedCount, 20);
+
+      // Verify disk persistence across close & reopen
+      store.close();
+      store = new GraphStore(dbPath);
+      assert.equal(store.getGraph("g_disk_perf").name, "Disk Perf Batch");
+      assert.equal(store.listNodes("g_disk_perf").length, 20);
+      assert.equal(store.hasGraph("g_atomic_rollback_new"), false);
+      assert.equal(store.listNodes("g_atomic_rollback_existing").length, 20);
+    } finally {
+      store?.close();
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});

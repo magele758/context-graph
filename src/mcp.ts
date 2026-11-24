@@ -170,6 +170,8 @@ export const MCP_TOOLS = [
         machineId: { type: "string" },
         maxCodeExcerptChars: { type: "integer" },
         maxCommandExcerptChars: { type: "integer" },
+        autoCreate: { type: "boolean" },
+        graphName: { type: "string" },
         prune: { type: "boolean" },
         compile: { type: "boolean" },
         compileOptions: { type: "object" },

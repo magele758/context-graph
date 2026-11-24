@@ -215,6 +215,8 @@ export function validateIngestArtifactsOptions(
     ...(raw.maxCommandExcerptChars !== undefined
       ? { maxCommandExcerptChars: raw.maxCommandExcerptChars }
       : {}),
+    ...(raw.autoCreate !== undefined ? { autoCreate: raw.autoCreate } : {}),
+    ...(raw.graphName !== undefined ? { graphName: raw.graphName } : {}),
   };
 
   if (merged.scope !== undefined && typeof merged.scope !== "string") {
@@ -255,6 +257,28 @@ export function validateIngestArtifactsOptions(
       400,
     );
   }
+  if (merged.autoCreate !== undefined && typeof merged.autoCreate !== "boolean") {
+    throw new ContextGraphError("'autoCreate' must be a boolean", "VALIDATION_ERROR", 400);
+  }
+  let normalizedGraphName: string | undefined;
+  if (merged.graphName !== undefined) {
+    if (typeof merged.graphName !== "string") {
+      throw new ContextGraphError(
+        "'graphName' must be a non-empty string of at most 120 characters",
+        "VALIDATION_ERROR",
+        400,
+      );
+    }
+    const trimmed = merged.graphName.trim();
+    if (trimmed.length === 0 || trimmed.length > 120 || merged.graphName.length > 120) {
+      throw new ContextGraphError(
+        "'graphName' must be a non-empty string of at most 120 characters",
+        "VALIDATION_ERROR",
+        400,
+      );
+    }
+    normalizedGraphName = trimmed;
+  }
 
   return {
     ...(merged.scope !== undefined ? { scope: merged.scope } : {}),
@@ -266,6 +290,8 @@ export function validateIngestArtifactsOptions(
     ...(merged.maxCommandExcerptChars !== undefined
       ? { maxCommandExcerptChars: merged.maxCommandExcerptChars }
       : {}),
+    ...(merged.autoCreate !== undefined ? { autoCreate: merged.autoCreate } : {}),
+    ...(normalizedGraphName !== undefined ? { graphName: normalizedGraphName } : {}),
   };
 }
 
@@ -1152,10 +1178,11 @@ function extractWriteContent(
 }
 
 /**
- * Ingests a batch of tool-trajectory events into a Context Graph with
- * deterministic idempotent node IDs, file/range/edit versioning, command
- * failure linking, and server-native cross-compaction cleanup of superseded
- * `#edit` and `#range=...` sub-nodes.
+ * Ingests a batch of tool-trajectory events into a Context Graph inside a
+ * single atomic SQLite transaction with deterministic idempotent node IDs,
+ * file/range/edit versioning, command failure linking, optional atomic
+ * `autoCreate` graph provisioning, and server-native cross-compaction cleanup
+ * of superseded `#edit` and `#range=...` sub-nodes.
  */
 export function ingestToolArtifacts(
   store: GraphStore,
@@ -1163,9 +1190,42 @@ export function ingestToolArtifacts(
   events: readonly ToolTrajectoryEvent[],
   opts?: IngestArtifactsOptions,
 ): IngestArtifactsResult {
-  // Ensure graph exists up front
-  store.getGraph(graphId);
+  return store.runInTransaction(() => {
+    if (opts?.autoCreate === true) {
+      if (!graphId || !graphId.trim() || graphId !== graphId.trim()) {
+        throw new ContextGraphError(
+          "'graphId' must be a non-empty trimmed string when autoCreate is enabled",
+          "VALIDATION_ERROR",
+          400,
+        );
+      }
+      if (!store.hasGraph(graphId)) {
+        try {
+          store.createGraph({
+            id: graphId,
+            name: opts.graphName?.trim() || graphId,
+          });
+        } catch (err) {
+          if (!(err instanceof ContextGraphError && err.code === "ALREADY_EXISTS")) {
+            throw err;
+          }
+        }
+      }
+    } else {
+      // Preserve 100% existing behavior: fail with 404 NotFoundError if graph is missing
+      store.getGraph(graphId);
+    }
 
+    return ingestToolArtifactsInTx(store, graphId, events, opts);
+  });
+}
+
+function ingestToolArtifactsInTx(
+  store: GraphStore,
+  graphId: string,
+  events: readonly ToolTrajectoryEvent[],
+  opts?: IngestArtifactsOptions,
+): IngestArtifactsResult {
   const existingNodes = store.listNodes(graphId);
   const existingById = new Map<string, GraphNode>();
   const activeByResourceKey = new Map<string, GraphNode[]>();
