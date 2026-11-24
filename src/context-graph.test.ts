@@ -3813,6 +3813,46 @@ describe("v0.2.5 Single-Transaction Batching & Atomic autoCreate Suite", () => {
       });
       assert.equal(badNameLong.status, 400);
 
+      // 3b. [B1] Invalid / unsafe graphIds with autoCreate: true -> 400 VALIDATION_ERROR on HTTP & MCP
+      for (const unsafeGraphId of ["bad\nid\x00x", "../etc/passwd", "g".repeat(121)]) {
+        const httpBadId = await fetch(
+          `${bound.url}/v1/graphs/${encodeURIComponent(unsafeGraphId)}/ingest-artifacts`,
+          {
+            method: "POST",
+            headers: authHeaders,
+            body: JSON.stringify({ autoCreate: true, events: [sampleEvents[0]!] }),
+          },
+        );
+        assert.equal(httpBadId.status, 400, `Expected HTTP 400 for unsafe graphId ${JSON.stringify(unsafeGraphId)}`);
+        const httpBadJson = (await httpBadId.json()) as { error: { code: string } };
+        assert.equal(httpBadJson.error.code, "VALIDATION_ERROR");
+
+        const mcpBadId = await fetch(`${bound.url}/mcp`, {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 98,
+            method: "tools/call",
+            params: {
+              name: "cg_ingest_artifacts",
+              arguments: {
+                graphId: unsafeGraphId,
+                autoCreate: true,
+                events: [sampleEvents[0]!],
+              },
+            },
+          }),
+        });
+        assert.equal(mcpBadId.status, 200);
+        const mcpBadBody = (await mcpBadId.json()) as {
+          result: { isError?: boolean; content: Array<{ text: string }> };
+        };
+        assert.equal(mcpBadBody.result.isError, true);
+        const mcpErr = JSON.parse(mcpBadBody.result.content[0]!.text) as { code: string };
+        assert.equal(mcpErr.code, "VALIDATION_ERROR");
+      }
+
       // 4. Valid autoCreate: true creates missing graph + ingests + compiles in ONE single HTTP call
       const okRes1 = await fetch(`${bound.url}/v1/graphs/sess_auto_1/ingest-artifacts`, {
         method: "POST",
@@ -4070,6 +4110,15 @@ describe("v0.2.5 Single-Transaction Batching & Atomic autoCreate Suite", () => {
       store.addNode = origAddNode;
       const recovered = ingestToolArtifacts(store, "g_atomic_rollback_existing", buildBatch("rec"));
       assert.equal(recovered.ingestedCount, 20);
+
+      // [B1] Direct API rejects unsafe graphIds on autoCreate without creating disk rows
+      for (const unsafeId of ["bad\nid\x00x", "../etc/passwd", "g".repeat(121)]) {
+        assert.throws(
+          () => ingestToolArtifacts(store!, unsafeId, [events20[0]!], { autoCreate: true }),
+          (err: unknown) => err instanceof ContextGraphError && err.code === "VALIDATION_ERROR" && err.statusCode === 400,
+        );
+        assert.equal(store.hasGraph(unsafeId), false);
+      }
 
       // Verify disk persistence across close & reopen
       store.close();

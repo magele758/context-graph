@@ -322,8 +322,8 @@ export class GraphStore {
     }
 
     const spName = `cg_sp_${this.txDepth}`;
-    this.txDepth++;
     this.db.exec(`SAVEPOINT ${spName}`);
+    this.txDepth++;
     try {
       const result = fn();
       this.db.exec(`RELEASE SAVEPOINT ${spName}`);

@@ -1177,6 +1177,8 @@ function extractWriteContent(
   return output;
 }
 
+const SAFE_GRAPH_ID_RE = /^[A-Za-z0-9._:@-]{1,120}$/;
+
 /**
  * Ingests a batch of tool-trajectory events into a Context Graph inside a
  * single atomic SQLite transaction with deterministic idempotent node IDs,
@@ -1192,9 +1194,9 @@ export function ingestToolArtifacts(
 ): IngestArtifactsResult {
   return store.runInTransaction(() => {
     if (opts?.autoCreate === true) {
-      if (!graphId || !graphId.trim() || graphId !== graphId.trim()) {
+      if (!SAFE_GRAPH_ID_RE.test(graphId) || graphId.includes("..")) {
         throw new ContextGraphError(
-          "'graphId' must be a non-empty trimmed string when autoCreate is enabled",
+          "'graphId' must match /^[A-Za-z0-9._:@-]{1,120}$/ without '..' when autoCreate is enabled",
           "VALIDATION_ERROR",
           400,
         );
