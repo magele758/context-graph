@@ -686,34 +686,20 @@ function packDiffLines(lines: readonly string[], maxChars: number): string {
     return packLinesSequentially(nonEmpty, maxChars);
   }
 
-  // Always preserve `+` replacement lines: give them at least 65% of maxChars.
-  const minAddedBudget = Math.ceil(maxChars * 0.65);
-  const fullAdded = packLinesSequentially(addedLines, maxChars);
-
-  // If all `+` lines fit with comfortable room for a `-` context line, include both
-  if (fullAdded.length <= maxChars - 24) {
-    const remForRemoved = maxChars - fullAdded.length - 1;
+  // ONLY include `-` lines if ALL `+` lines fit completely with room to spare (`<= maxChars - 24`)
+  // and at least one non-empty `-` line fits in the leftover budget. Under tight budgets, drop `-`
+  // lines completely and give 100% of `maxChars` to `+` replacement lines so new values are never cut!
+  const fullAddedRaw = addedLines.join("\n");
+  if (fullAddedRaw.length <= maxChars - 24) {
+    const remForRemoved = maxChars - fullAddedRaw.length - 1;
     const compactRemoved = packLinesSequentially(removedLines, remForRemoved);
-    if (compactRemoved.length > 0 && compactRemoved.length + 1 + fullAdded.length <= maxChars) {
-      return `${compactRemoved}\n${fullAdded}`;
+    if (compactRemoved.length > 0 && compactRemoved.length + 1 + fullAddedRaw.length <= maxChars) {
+      return `${compactRemoved}\n${fullAddedRaw}`;
     }
-    return fullAdded;
+    return fullAddedRaw;
   }
 
-  // Tight budget: reserve at least 65% for `+` lines; include compact `-` only if budget allows
-  const maxRemovedBudget = maxChars - minAddedBudget - 1;
-  if (maxChars >= 48 && maxRemovedBudget >= 18) {
-    const compactRemoved = packLinesSequentially(removedLines, maxRemovedBudget);
-    if (compactRemoved.length > 0) {
-      const addedBudget = maxChars - compactRemoved.length - 1;
-      const compactAdded = packLinesSequentially(addedLines, addedBudget);
-      if (compactAdded.length > 0 && compactRemoved.length + 1 + compactAdded.length <= maxChars) {
-        return `${compactRemoved}\n${compactAdded}`;
-      }
-    }
-  }
-
-  return fullAdded;
+  return packLinesSequentially(addedLines, maxChars);
 }
 
 function stripTrailingHexOffset(line: string): string {

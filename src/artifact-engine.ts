@@ -10,6 +10,7 @@ import type { GraphStore } from "./graph-store.ts";
 import {
   ContextGraphError,
   type ClassifiedToolEvent,
+  type EditReplacementPair,
   type FileOpKind,
   type GraphEdge,
   type GraphNode,
@@ -430,6 +431,267 @@ function extractRangeInfo(
   return undefined;
 }
 
+const MAX_EDIT_PAIRS = 16 as const;
+
+function readDefinedStringArg(
+  args: Record<string, unknown> | undefined,
+  keys: readonly string[],
+): string | undefined {
+  if (!args) return undefined;
+  for (const key of keys) {
+    const val = args[key];
+    if (typeof val === "string") {
+      return val;
+    }
+  }
+  return undefined;
+}
+
+function trimSharedContextPair(rawOld: string, rawNew: string): EditReplacementPair | null {
+  const cleanOld = sanitizeNeutralText(rawOld);
+  const cleanNew = sanitizeNeutralText(rawNew);
+  if (cleanOld === cleanNew) return null;
+
+  const oldLines = cleanOld.length > 0 ? cleanOld.split("\n") : [];
+  const newLines = cleanNew.length > 0 ? cleanNew.split("\n") : [];
+
+  let prefix = 0;
+  while (
+    prefix < oldLines.length &&
+    prefix < newLines.length &&
+    oldLines[prefix] === newLines[prefix]
+  ) {
+    prefix++;
+  }
+  let oldEnd = oldLines.length - 1;
+  let newEnd = newLines.length - 1;
+  while (
+    oldEnd >= prefix &&
+    newEnd >= prefix &&
+    oldLines[oldEnd] === newLines[newEnd]
+  ) {
+    oldEnd--;
+    newEnd--;
+  }
+
+  const trimmedOld = oldLines
+    .slice(prefix, oldEnd + 1)
+    .map((l) => l.trimEnd())
+    .join("\n")
+    .trim();
+  const trimmedNew = newLines
+    .slice(prefix, newEnd + 1)
+    .map((l) => l.trimEnd())
+    .join("\n")
+    .trim();
+
+  if (!trimmedOld && !trimmedNew) return null;
+  if (trimmedOld === trimmedNew) return null;
+  return { oldText: trimmedOld, newText: trimmedNew };
+}
+
+/**
+ * Strictly linear O(N) extraction of `-`/`+` replacement pairs from a unified
+ * or compact diff string (skips diff headers and pairs consecutive `-` and `+` runs).
+ */
+export function extractPairsFromDiffText(diffText: string): EditReplacementPair[] {
+  if (!diffText) return [];
+  const lines = sanitizeNeutralText(diffText).split("\n");
+  const pairs: EditReplacementPair[] = [];
+
+  let removedRun: string[] = [];
+  let addedRun: string[] = [];
+
+  const stripDiffMarker = (line: string): string => {
+    // Strip leading `-` or `+`, and strip a single separating space when formatted as `- text` / `+ text`
+    const rest = line.slice(1);
+    return rest.startsWith(" ") ? rest.slice(1) : rest;
+  };
+
+  const flushHunk = () => {
+    if (removedRun.length === 0 && addedRun.length === 0) return;
+    if (pairs.length < MAX_EDIT_PAIRS) {
+      const pair = trimSharedContextPair(removedRun.join("\n"), addedRun.join("\n"));
+      if (pair) pairs.push(pair);
+    }
+    removedRun = [];
+    addedRun = [];
+  };
+
+  for (const rawLine of lines) {
+    if (
+      /^(?:---|\+\+\+|\*\*\*|@@|diff --git|index )/.test(rawLine)
+    ) {
+      flushHunk();
+      continue;
+    }
+    if (rawLine.startsWith("-")) {
+      if (addedRun.length > 0) {
+        flushHunk();
+      }
+      removedRun.push(stripDiffMarker(rawLine));
+    } else if (rawLine.startsWith("+")) {
+      addedRun.push(stripDiffMarker(rawLine));
+    } else {
+      flushHunk();
+    }
+  }
+  flushHunk();
+  return pairs;
+}
+
+/**
+ * Pure linear O(N) extractor returning structured `{ oldText, newText }` edit
+ * replacement pairs from single-edit args, multi-edit arrays (`ReplacementChunks`
+ * / `edits`), or fallback unified/apply_patch diff hunks (capped at 16 pairs).
+ */
+export function extractEditPairs(
+  args: Record<string, unknown> | undefined,
+): EditReplacementPair[] {
+  if (!args) return [];
+  const pairs: EditReplacementPair[] = [];
+
+  const oldText = readDefinedStringArg(args, [
+    "old_string",
+    "oldString",
+    "old_text",
+    "oldText",
+    "TargetContent",
+    "search",
+  ]);
+  const newText = readDefinedStringArg(args, [
+    "new_string",
+    "newString",
+    "new_text",
+    "newText",
+    "ReplacementContent",
+    "replace",
+  ]);
+  if (oldText !== undefined || newText !== undefined) {
+    const pair = trimSharedContextPair(oldText ?? "", newText ?? "");
+    if (pair) pairs.push(pair);
+    return pairs;
+  }
+
+  const chunks = (args.ReplacementChunks ?? args.edits) as unknown;
+  if (Array.isArray(chunks) && chunks.length > 0) {
+    for (const chunk of chunks) {
+      if (pairs.length >= MAX_EDIT_PAIRS) break;
+      if (!chunk || typeof chunk !== "object" || Array.isArray(chunk)) continue;
+      const rec = chunk as Record<string, unknown>;
+      const cOld = readDefinedStringArg(rec, [
+        "old_string",
+        "oldString",
+        "old_text",
+        "oldText",
+        "TargetContent",
+        "search",
+      ]);
+      const cNew = readDefinedStringArg(rec, [
+        "new_string",
+        "newString",
+        "new_text",
+        "newText",
+        "ReplacementContent",
+        "replace",
+      ]);
+      if (cOld === undefined && cNew === undefined) continue;
+      const pair = trimSharedContextPair(cOld ?? "", cNew ?? "");
+      if (pair) pairs.push(pair);
+    }
+    if (pairs.length > 0) return pairs;
+  }
+
+  const patch = readRawStringArg(args, ["patch", "diff"]);
+  if (patch) {
+    return extractPairsFromDiffText(patch);
+  }
+
+  return pairs;
+}
+
+export function formatEditPairsAsDiff(pairs: readonly EditReplacementPair[]): string {
+  const parts: string[] = [];
+  for (const p of pairs) {
+    const diff = formatLineReplacementDiff(p.oldText, p.newText);
+    if (diff.length > 0) parts.push(diff);
+  }
+  return parts.join("\n").trim();
+}
+
+function normalizeStoredEditPairs(raw: unknown): EditReplacementPair[] {
+  if (!Array.isArray(raw)) return [];
+  const out: EditReplacementPair[] = [];
+  for (const item of raw) {
+    if (out.length >= MAX_EDIT_PAIRS) break;
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const rec = item as Record<string, unknown>;
+    if (typeof rec.oldText === "string" && typeof rec.newText === "string") {
+      if (rec.oldText !== rec.newText && (rec.oldText.trim() || rec.newText.trim())) {
+        out.push({ oldText: rec.oldText, newText: rec.newText });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Accumulates chained partial edits on the same file:
+ * - Transitive chain `A -> B` followed by `B -> C` collapses in-place to `A -> C`
+ *   (and `A -> B -> A` cancels cleanly).
+ * - Repeated edit with matching trimmed `oldText` updates to the newer `newText`.
+ * - Distinct edits append cleanly without wiping earlier edits (capped at 16 most recent).
+ */
+export function mergeEditPairs(
+  existing: readonly EditReplacementPair[],
+  incoming: readonly EditReplacementPair[],
+): EditReplacementPair[] {
+  const merged: EditReplacementPair[] = existing.map((p) => ({
+    oldText: p.oldText,
+    newText: p.newText,
+  }));
+
+  for (const next of incoming) {
+    const nextOldTrim = next.oldText.trim();
+    const nextNewTrim = next.newText.trim();
+
+    // 1. Transitive chain collapse: prior `A -> B` + incoming `B -> C` => `A -> C`
+    if (nextOldTrim.length > 0) {
+      const chainIdx = merged.findIndex(
+        (p) => p.newText.trim().length > 0 && p.newText.trim() === nextOldTrim,
+      );
+      if (chainIdx >= 0) {
+        const prior = merged[chainIdx]!;
+        if (prior.oldText.trim() === nextNewTrim) {
+          // Exact revert A -> B -> A cancels out cleanly
+          merged.splice(chainIdx, 1);
+        } else {
+          merged[chainIdx] = { oldText: prior.oldText, newText: next.newText };
+        }
+        continue;
+      }
+
+      // 2. Same `oldText` replaced again -> update in-place with latest `newText`
+      const sameOldIdx = merged.findIndex((p) => p.oldText.trim() === nextOldTrim);
+      if (sameOldIdx >= 0) {
+        merged[sameOldIdx] = { oldText: next.oldText, newText: next.newText };
+        continue;
+      }
+    }
+
+    // 3. Deduplicate identical pair
+    if (merged.some((p) => p.oldText === next.oldText && p.newText === next.newText)) {
+      continue;
+    }
+
+    merged.push({ oldText: next.oldText, newText: next.newText });
+  }
+
+  return merged.length > MAX_EDIT_PAIRS
+    ? merged.slice(merged.length - MAX_EDIT_PAIRS)
+    : merged;
+}
+
 function formatLineReplacementDiff(oldText: string, newText: string): string {
   const oldLines = sanitizeNeutralText(oldText).split("\n");
   const newLines = sanitizeNeutralText(newText).split("\n");
@@ -589,6 +851,7 @@ export function classifyToolEvent(event: ToolTrajectoryEvent): ClassifiedToolEve
     let rangeKey: string | undefined;
     let rangeLabel: string | undefined;
     let diffText: string | undefined;
+    let editPairs: EditReplacementPair[] | undefined;
 
     if (isReadTool) {
       const rangeInfo = extractRangeInfo(args);
@@ -606,7 +869,13 @@ export function classifyToolEvent(event: ToolTrajectoryEvent): ClassifiedToolEve
     } else {
       fileOpKind = inferredOpKind ?? "partial_edit";
       if (fileOpKind === "partial_edit") {
-        diffText = extractEditDiffText(args);
+        const extractedPairs = extractEditPairs(args);
+        if (extractedPairs.length > 0) {
+          editPairs = extractedPairs;
+          diffText = formatEditPairsAsDiff(extractedPairs);
+        } else {
+          diffText = extractEditDiffText(args);
+        }
       }
     }
 
@@ -635,6 +904,7 @@ export function classifyToolEvent(event: ToolTrajectoryEvent): ClassifiedToolEve
       rangeKey,
       rangeLabel,
       diffText,
+      editPairs,
       resourceKey,
       displayLabel,
     };
@@ -1089,9 +1359,37 @@ export function ingestToolArtifacts(
       }
 
       // 2. Partial edit -> file:<scopedPath>#edit, preserves untouched base read_file
+      //    and accumulates chained partial edits across rounds without wiping prior edits!
       if (c.fileOpKind === "partial_edit") {
+        let priorPairs: EditReplacementPair[] = [];
+        if (priorSameKey.length > 0) {
+          const latestPriorId = priorSameKey[priorSameKey.length - 1]!;
+          const latestPriorNode = existingById.get(latestPriorId);
+          if (latestPriorNode) {
+            if (Array.isArray(latestPriorNode.metadata.editPairs)) {
+              priorPairs = normalizeStoredEditPairs(latestPriorNode.metadata.editPairs);
+            } else {
+              priorPairs = extractPairsFromDiffText(latestPriorNode.content);
+            }
+          }
+        }
+        const incomingPairs =
+          c.editPairs && c.editPairs.length > 0
+            ? c.editPairs
+            : c.diffText
+              ? extractPairsFromDiffText(c.diffText)
+              : [];
+        const hadPairsSource = priorPairs.length > 0 || incomingPairs.length > 0;
+        const mergedPairs = hadPairsSource ? mergeEditPairs(priorPairs, incomingPairs) : [];
+        const mergedDiffText =
+          mergedPairs.length > 0
+            ? formatEditPairsAsDiff(mergedPairs)
+            : hadPairsSource
+              ? undefined
+              : c.diffText;
+
         const excerpt =
-          compactCodeExcerpt(effectiveEvent.output, maxCodeChars, { diffText: c.diffText }) ||
+          compactCodeExcerpt(effectiveEvent.output, maxCodeChars, { diffText: mergedDiffText }) ||
           `edited ${c.path}`;
         const summary = truncateAtWordBoundary(excerpt, 240);
         const stub = c.displayLabel;
@@ -1116,6 +1414,7 @@ export function ingestToolArtifacts(
             fileOpKind: "partial_edit",
             fileScopeKey: scopeKey,
             editedScope: true,
+            ...(hadPairsSource ? { editPairs: mergedPairs } : {}),
             path: c.path,
             displayLabel: c.displayLabel,
             tool: effectiveEvent.tool,

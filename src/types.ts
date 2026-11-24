@@ -362,6 +362,11 @@ export interface ToolTrajectoryEvent {
   scope?: string;
 }
 
+export interface EditReplacementPair {
+  oldText: string;
+  newText: string;
+}
+
 export interface ClassifiedToolEvent {
   event: ToolTrajectoryEvent;
   family: ToolFamily;
@@ -371,6 +376,7 @@ export interface ClassifiedToolEvent {
   rangeKey?: string;
   rangeLabel?: string;
   diffText?: string;
+  editPairs?: EditReplacementPair[];
   command?: string;
   searchKey?: string;
   resourceKey: string | null;

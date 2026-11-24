@@ -6,13 +6,19 @@ import { PassThrough } from "node:stream";
 import { after, before, describe, it } from "node:test";
 import {
   classifyToolEvent,
+  extractEditPairs,
   ingestToolArtifacts,
+  mergeEditPairs,
   normalizeCommandKey,
   pruneTrajectoryEvents,
 } from "./artifact-engine.ts";
 import { runBenchmark } from "./benchmark.ts";
 import { runCli } from "./cli.ts";
-import { compileContext, DEFAULT_COMPACT_MAX_CHARS } from "./compiler.ts";
+import {
+  applyEditPairsToText,
+  compileContext,
+  DEFAULT_COMPACT_MAX_CHARS,
+} from "./compiler.ts";
 import {
   compactCodeExcerpt,
   compactCommandExcerpt,
@@ -1740,12 +1746,26 @@ describe("v0.2 Compact Markdown Compiler & Priority Budget Engine", () => {
     assert.ok(out.includes("src/dispatcher.ts:41:7"));
     assert.ok(!out.includes("node_modules/"));
 
-    // Tier 2 preserves base snapshot BEFORE #edit delta, with full exported constants intact
-    const baseIdx = out.indexOf("`src/dispatcher.ts`:");
-    const editIdx = out.indexOf("[file edit] `src/dispatcher.ts`:");
-    assert.ok(baseIdx >= 0 && editIdx > baseIdx, `Base snapshot must precede #edit delta:\n${out}`);
+    // Tier 2 merges base snapshot + #edit delta in-place into ONE [file edited] line with zero stale values
+    assert.ok(
+      out.includes("- [file edited] `src/dispatcher.ts`:"),
+      `Expected merged [file edited] line:\n${out}`,
+    );
+    assert.ok(
+      !out.includes("[file edit] `src/dispatcher.ts`:"),
+      `Merged edit must not duplicate a separate [file edit] line:\n${out}`,
+    );
     assert.ok(out.includes("RETRY_DELAY_MS = 450"));
     assert.ok(out.includes("MAX_INFLIGHT = 64"));
+    assert.ok(
+      !out.includes("MAX_INFLIGHT = 32"),
+      `Stale base constant must be replaced in-place:\n${out}`,
+    );
+    // Underlying DAG provenance remains intact (both base and #edit nodes stay active and accounted for)
+    const activeDispatcherNodes = store
+      .listNodes(g.id, { status: "active" })
+      .filter((n) => n.metadata.fileScopeKey === "src/dispatcher.ts");
+    assert.equal(activeDispatcherNodes.length, 2, "Both base and #edit nodes remain active in DAG");
 
     // Tier 3 collapses unmodified background files into a single compact line
     assert.ok(out.includes("- [other read files]:"), `Expected collapsed other read files:\n${out}`);
@@ -3190,5 +3210,414 @@ describe("v0.2.3 Code Excerpt, Go Frame Pairing & Lossless Vendor Stripping Suit
     stripVendorStackFrames("runtime/" + "a".repeat(20_000));
     stripVendorStackFrames("runtime." + "a".repeat(20_000));
     assert.ok(Date.now() - t0 < 10, "Constrained ^runtime branch must stay strictly O(N) < 10ms");
+  });
+});
+
+describe("v0.2.4 Chained Partial-Edit Accumulation, In-Place Merge & Tight-Diff Protection Suite", () => {
+  it("58. accumulates chained multi-round partial edits, collapses transitive chains/reverts, and renders ONE merged [file edited] line", () => {
+    const store = new GraphStore(":memory:");
+    const g = store.createGraph({ id: "g_v24_chain", name: "Chained Partial Edits" });
+
+    // Round 1: base read + first partial edit (CONST_A: 16 -> 48)
+    ingestToolArtifacts(store, g.id, [
+      {
+        callId: "r1_read",
+        tool: "read_file",
+        args: { path: "src/worker-queue.ts" },
+        ok: true,
+        output: [
+          "export const CONST_A = 16;",
+          "export const CONST_B = 'alpha';",
+          "export const CONST_C = 250;",
+          "export function runWorker() { return CONST_A; }",
+        ].join("\n"),
+      },
+      {
+        callId: "r1_edit_a",
+        tool: "edit_file",
+        args: {
+          path: "src/worker-queue.ts",
+          old_string: "export const CONST_A = 16;",
+          new_string: "export const CONST_A = 48;",
+        },
+        ok: true,
+        output: "Updated src/worker-queue.ts",
+      },
+    ]);
+
+    // Round 2: second partial edit on DIFFERENT symbol (CONST_B: 'alpha' -> 'beta')
+    // Must accumulate onto #edit without wiping Round 1's CONST_A = 48!
+    ingestToolArtifacts(store, g.id, [
+      {
+        callId: "r2_edit_b",
+        tool: "edit_file",
+        args: {
+          path: "src/worker-queue.ts",
+          old_string: "export const CONST_B = 'alpha';",
+          new_string: "export const CONST_B = 'beta';",
+        },
+        ok: true,
+        output: "Updated src/worker-queue.ts",
+      },
+    ]);
+
+    const activeAfterR2 = store.listNodes(g.id, { status: "active" });
+    const editNodeR2 = activeAfterR2.find((n) => n.resourceKey === "file:src/worker-queue.ts#edit");
+    assert.ok(editNodeR2, "Active #edit node must exist");
+    const pairsR2 = editNodeR2.metadata.editPairs as Array<{ oldText: string; newText: string }>;
+    assert.equal(pairsR2.length, 2, "Round 2 #edit must accumulate both Round 1 and Round 2 pairs");
+
+    const compiledR2 = compileContext(store, {
+      graphId: g.id,
+      format: "compact_markdown",
+      maxOutputChars: 720,
+    });
+    assert.ok(compiledR2.promptText.includes("- [file edited] `src/worker-queue.ts`:"));
+    assert.ok(!compiledR2.promptText.includes("[file edit] `src/worker-queue.ts`:"));
+    assert.ok(compiledR2.promptText.includes("CONST_A = 48"), compiledR2.promptText);
+    assert.ok(compiledR2.promptText.includes("CONST_B = 'beta'"), compiledR2.promptText);
+    assert.ok(compiledR2.promptText.includes("CONST_C = 250"), compiledR2.promptText);
+    assert.ok(!compiledR2.promptText.includes("CONST_A = 16"), "Stale CONST_A must never appear");
+    assert.ok(!compiledR2.promptText.includes("'alpha'"), "Stale CONST_B must never appear");
+
+    // Round 3: transitive chain edit on CONST_A (48 -> 96) collapses 16 -> 48 -> 96 to 16 -> 96
+    ingestToolArtifacts(store, g.id, [
+      {
+        callId: "r3_edit_a2",
+        tool: "edit_file",
+        args: {
+          path: "src/worker-queue.ts",
+          old_string: "export const CONST_A = 48;",
+          new_string: "export const CONST_A = 96;",
+        },
+        ok: true,
+        output: "Updated src/worker-queue.ts",
+      },
+    ]);
+
+    const editNodeR3 = store
+      .listNodes(g.id, { status: "active" })
+      .find((n) => n.resourceKey === "file:src/worker-queue.ts#edit")!;
+    const pairsR3 = editNodeR3.metadata.editPairs as Array<{ oldText: string; newText: string }>;
+    assert.equal(pairsR3.length, 2, "Transitive chain must collapse in-place instead of growing");
+    assert.equal(pairsR3[0]?.oldText, "export const CONST_A = 16;");
+    assert.equal(pairsR3[0]?.newText, "export const CONST_A = 96;");
+
+    const compiledR3 = compileContext(store, {
+      graphId: g.id,
+      format: "compact_markdown",
+      maxOutputChars: 720,
+    });
+    assert.ok(compiledR3.promptText.includes("CONST_A = 96"), compiledR3.promptText);
+    assert.ok(compiledR3.promptText.includes("CONST_B = 'beta'"), compiledR3.promptText);
+    assert.ok(!compiledR3.promptText.includes("CONST_A = 16"));
+    assert.ok(!compiledR3.promptText.includes("CONST_A = 48"));
+
+    // Round 4: exact revert on CONST_B ('beta' -> 'alpha') cancels CONST_B cleanly
+    // Round 5: exact revert on CONST_A (96 -> 16) empties editPairs and merges back to clean base
+    ingestToolArtifacts(store, g.id, [
+      {
+        callId: "r4_revert_b",
+        tool: "edit_file",
+        args: {
+          path: "src/worker-queue.ts",
+          old_string: "export const CONST_B = 'beta';",
+          new_string: "export const CONST_B = 'alpha';",
+        },
+        ok: true,
+        output: "Reverted CONST_B",
+      },
+      {
+        callId: "r5_revert_a",
+        tool: "edit_file",
+        args: {
+          path: "src/worker-queue.ts",
+          old_string: "export const CONST_A = 96;",
+          new_string: "export const CONST_A = 16;",
+        },
+        ok: true,
+        output: "Reverted CONST_A",
+      },
+    ]);
+
+    const editNodeR5 = store
+      .listNodes(g.id, { status: "active" })
+      .find((n) => n.resourceKey === "file:src/worker-queue.ts#edit")!;
+    assert.deepEqual(editNodeR5.metadata.editPairs, [], "Full revert must cancel editPairs cleanly to []");
+
+    const compiledR5 = compileContext(store, {
+      graphId: g.id,
+      format: "compact_markdown",
+      maxOutputChars: 720,
+    });
+    assert.ok(compiledR5.promptText.includes("- [file edited] `src/worker-queue.ts`:"));
+    assert.ok(!compiledR5.promptText.includes("[file edit] `src/worker-queue.ts`:"));
+    assert.ok(compiledR5.promptText.includes("CONST_A = 16"));
+    assert.ok(compiledR5.promptText.includes("CONST_B = 'alpha'"));
+    assert.ok(!compiledR5.promptText.includes("CONST_A = 96"));
+    assert.ok(!compiledR5.promptText.includes("'beta'"));
+
+    store.close();
+  });
+
+  it("59. prevents Tier 2 starvation and stale base poisoning across 3 partially-edited files + failing check under default 720c", () => {
+    const store = new GraphStore(":memory:");
+    const g = store.createGraph({ id: "g_v24_multi", name: "Multi-File 3-Round Budget" });
+
+    // Round 1: read all 3 files + edit file 1
+    ingestToolArtifacts(store, g.id, [
+      {
+        callId: "m1_r1",
+        tool: "read_file",
+        args: { path: "src/ui/notice.ts" },
+        ok: true,
+        output: "export const NOTICE_STYLE = 'info';\nexport const NOTICE_TTL_MS = 5000;\n",
+      },
+      {
+        callId: "m1_r2",
+        tool: "read_file",
+        args: { path: "src/gateway/quota.ts" },
+        ok: true,
+        output: "export const WINDOW_LIMIT = 100;\nexport const BURST_FACTOR = 2;\nexport function checkQuota(n: number) { return n <= WINDOW_LIMIT; }\n",
+      },
+      {
+        callId: "m1_r3",
+        tool: "read_file",
+        args: { path: "deploy/service.yaml" },
+        ok: true,
+        output: "service: edge-router\nreplicas: 2\nregion: us-west-2\n",
+      },
+      {
+        callId: "m1_e1",
+        tool: "edit_file",
+        args: {
+          path: "src/ui/notice.ts",
+          old_string: "export const NOTICE_STYLE = 'info';",
+          new_string: "export const NOTICE_STYLE = 'maintenance';",
+        },
+        ok: true,
+        output: "Edited src/ui/notice.ts",
+      },
+    ]);
+
+    // Round 2: edit file 2
+    ingestToolArtifacts(store, g.id, [
+      {
+        callId: "m2_e2",
+        tool: "edit_file",
+        args: {
+          path: "src/gateway/quota.ts",
+          old_string: "export const WINDOW_LIMIT = 100;",
+          new_string: "export const WINDOW_LIMIT = 250;",
+        },
+        ok: true,
+        output: "Edited src/gateway/quota.ts",
+      },
+    ]);
+
+    // Round 3: edit file 3 + failing check
+    ingestToolArtifacts(store, g.id, [
+      {
+        callId: "m3_e3",
+        tool: "edit_file",
+        args: {
+          path: "deploy/service.yaml",
+          old_string: "replicas: 2",
+          new_string: "replicas: 5",
+        },
+        ok: true,
+        output: "Edited deploy/service.yaml",
+      },
+      {
+        callId: "m3_fail",
+        tool: "bash",
+        args: { command: "npm test" },
+        ok: false,
+        output: [
+          "FAIL src/gateway/quota.test.ts > enforces burst window",
+          "  Error [ERR_QUOTA_DRIFT]: limit mismatch",
+          "    at checkQuota (src/gateway/quota.ts:28:5)",
+          "    at runTask (node_modules/vitest/dist/runner.js:410:12)",
+        ].join("\n"),
+      },
+    ]);
+
+    const compiled = compileContext(store, {
+      graphId: g.id,
+      format: "compact_markdown",
+    });
+    const out = compiled.promptText;
+
+    assert.ok(out.length <= DEFAULT_COMPACT_MAX_CHARS, `Expected <= ${DEFAULT_COMPACT_MAX_CHARS}, got ${out.length}`);
+    assert.ok(!out.includes("[file edit]"), `All 3 edited files should collapse cleanly without duplicate [file edit] lines:\n${out}`);
+
+    // Failing check + all 3 edited files preserved cleanly with zero starvation
+    assert.ok(out.includes("ERR_QUOTA_DRIFT"), out);
+    assert.ok(out.includes("src/gateway/quota.ts:28:5"), out);
+    assert.ok(out.includes("NOTICE_STYLE = 'maintenance'"), out);
+    assert.ok(out.includes("NOTICE_TTL_MS = 5000"), out);
+    assert.ok(out.includes("WINDOW_LIMIT = 250"), out);
+    assert.ok(out.includes("BURST_FACTOR = 2"), out);
+    assert.ok(out.includes("replicas: 5"), out);
+    assert.ok(out.includes("region: us-west-2"), out);
+
+    // ZERO stale values anywhere in compiled output
+    assert.ok(!out.includes("'info'"), `Stale NOTICE_STYLE leaked:\n${out}`);
+    assert.ok(!out.includes("WINDOW_LIMIT = 100"), `Stale WINDOW_LIMIT leaked:\n${out}`);
+    assert.ok(!out.includes("replicas: 2"), `Stale replicas leaked:\n${out}`);
+
+    store.close();
+  });
+
+  it("60. handles deep-body edits (Case B & Case C) and drops '-' before truncating '+' in tight packDiffLines", () => {
+    // Part A (Case C): pure deep-body edit not present in base excerpt keeps base + [file edit] in order
+    const longBodyLines = [
+      "export const ENGINE_MODE = 'fast';",
+      "export const QUEUE_DEPTH = 32;",
+      "export function executePipeline(input: number): number {",
+      ...Array.from({ length: 35 }, (_, i) => `  const stage${i} = input + ${i};`),
+      "  const internalFactor = 3;",
+      "  return stage0 * internalFactor;",
+      "}",
+    ].join("\n");
+
+    const storeC = new GraphStore(":memory:");
+    const gC = storeC.createGraph({ id: "g_v24_case_c", name: "Case C Deep Edit" });
+    ingestToolArtifacts(storeC, gC.id, [
+      {
+        callId: "c_read",
+        tool: "read_file",
+        args: { path: "src/deep-engine.ts" },
+        ok: true,
+        output: longBodyLines,
+      },
+      {
+        callId: "c_edit",
+        tool: "edit_file",
+        args: {
+          path: "src/deep-engine.ts",
+          old_string: "  const internalFactor = 3;",
+          new_string: "  const internalFactor = 9;",
+        },
+        ok: true,
+        output: "Updated src/deep-engine.ts",
+      },
+    ]);
+
+    const compiledC = compileContext(storeC, {
+      graphId: gC.id,
+      format: "compact_markdown",
+      maxOutputChars: 720,
+    });
+    const baseIdxC = compiledC.promptText.indexOf("- [file] `src/deep-engine.ts`:");
+    const editIdxC = compiledC.promptText.indexOf("- [file edit] `src/deep-engine.ts`:");
+    assert.ok(baseIdxC >= 0 && editIdxC > baseIdxC, `Case C must keep base before [file edit]:\n${compiledC.promptText}`);
+    assert.ok(compiledC.promptText.includes("ENGINE_MODE = 'fast'"));
+    assert.ok(compiledC.promptText.includes("+ const internalFactor = 9;"));
+
+    // Part B (Case B): adding a top-level edit produces patched base [file edited] + remaining deep [file edit] ONLY
+    ingestToolArtifacts(storeC, gC.id, [
+      {
+        callId: "c_edit_top",
+        tool: "edit_file",
+        args: {
+          path: "src/deep-engine.ts",
+          old_string: "export const ENGINE_MODE = 'fast';",
+          new_string: "export const ENGINE_MODE = 'strict';",
+        },
+        ok: true,
+        output: "Updated src/deep-engine.ts",
+      },
+    ]);
+
+    const compiledB = compileContext(storeC, {
+      graphId: gC.id,
+      format: "compact_markdown",
+      maxOutputChars: 720,
+    });
+    const patchedIdxB = compiledB.promptText.indexOf("- [file edited] `src/deep-engine.ts`:");
+    const remEditIdxB = compiledB.promptText.indexOf("- [file edit] `src/deep-engine.ts`:");
+    assert.ok(
+      patchedIdxB >= 0 && remEditIdxB > patchedIdxB,
+      `Case B must emit patched [file edited] followed by unapplied [file edit]:\n${compiledB.promptText}`,
+    );
+    assert.ok(compiledB.promptText.includes("ENGINE_MODE = 'strict'"));
+    assert.ok(!compiledB.promptText.includes("ENGINE_MODE = 'fast'"), "Patched base must not retain stale value");
+    assert.ok(compiledB.promptText.includes("+ const internalFactor = 9;"));
+    const remEditLine = compiledB.promptText.slice(remEditIdxB);
+    assert.ok(!remEditLine.includes("ENGINE_MODE"), `Remaining delta must only contain unapplied pairs:\n${remEditLine}`);
+    storeC.close();
+
+    // Part C: tight packDiffLines drops `-` completely instead of cutting `+` replacement values
+    const diffText = [
+      "- export const DISPLAY_VARIANT = 'info';",
+      "+ export const DISPLAY_VARIANT = 'maintenance';",
+    ].join("\n");
+
+    const tightDiff = compactCodeExcerpt("edited", 52, { diffText });
+    assert.ok(tightDiff.length <= 52, `Expected <= 52, got ${tightDiff.length}`);
+    assert.equal(
+      tightDiff,
+      "+ export const DISPLAY_VARIANT = 'maintenance';",
+      `Tight diff must drop '-' and preserve complete '+' line:\n${tightDiff}`,
+    );
+    assert.ok(!tightDiff.includes("'info'"), "Tight diff must never include stale '-' line at expense of '+'");
+
+    const wideDiff = compactCodeExcerpt("edited", 120, { diffText });
+    assert.ok(wideDiff.includes("- export const DISPLAY_VARIANT = 'info';"));
+    assert.ok(wideDiff.includes("+ export const DISPLAY_VARIANT = 'maintenance';"));
+  });
+
+  it("61. keeps extractEditPairs, mergeEditPairs, and applyEditPairsToText strictly O(N) (< 20ms) and immune to regex / $& / $$ injection", () => {
+    // Regex metacharacters and String.replace special patterns ($&, $$, $1, $', $`) must stay 100% literal
+    const metaOld = "const rx = /^([a-z]+.*+?^${}()|[]\\\\)$/;\nconst label = 'orig';";
+    const metaNew = "const rx = /^([a-z]+)$/;\nconst label = '$& $$ $1 $\\' $`';";
+    const base = `// header\n${metaOld}\nexport const DONE = true;`;
+
+    const applied = applyEditPairsToText(base, [{ oldText: metaOld, newText: metaNew }]);
+    assert.equal(applied.appliedCount, 1);
+    assert.equal(applied.unappliedPairs.length, 0);
+    assert.ok(
+      applied.patched.includes("const label = '$& $$ $1 $\\' $`';"),
+      `Replacement must preserve $& / $$ literally without interpolation:\n${applied.patched}`,
+    );
+    assert.ok(!applied.patched.includes("const label = 'orig';"));
+    assert.ok(applied.patched.includes("export const DONE = true;"));
+
+    // Adversarial 20KB+ strings and 100 edit pairs stress test
+    const bigBase = Array.from(
+      { length: 400 },
+      (_, i) => `export const ITEM_${i} = "${"x".repeat(48)}_${i}";`,
+    ).join("\n");
+    const edits100 = Array.from({ length: 100 }, (_, i) => ({
+      old_string: `export const ITEM_${i} = "${"x".repeat(48)}_${i}";`,
+      new_string: `export const ITEM_${i} = "${"y".repeat(48)}_${i}";`,
+    }));
+    const adversarialPatch = [
+      "--- a/big.ts",
+      "+++ b/big.ts",
+      ...Array.from({ length: 100 }, (_, i) => `- const p${i} = "${"(".repeat(180)}";\n+ const p${i} = "${"[".repeat(180)}";`),
+    ].join("\n");
+
+    // Warm JIT once
+    extractEditPairs({ old_string: "a", new_string: "b" });
+    mergeEditPairs([{ oldText: "a", newText: "b" }], [{ oldText: "b", newText: "c" }]);
+    applyEditPairsToText("a", [{ oldText: "a", newText: "b" }]);
+
+    const t0 = Date.now();
+    const extractedChunks = extractEditPairs({ edits: edits100 });
+    const extractedPatch = extractEditPairs({ patch: adversarialPatch });
+    const merged = mergeEditPairs(extractedChunks, extractedPatch);
+    const patchRes = applyEditPairsToText(bigBase, extractedChunks);
+    const elapsedMs = Date.now() - t0;
+
+    assert.equal(extractedChunks.length, 16, "extractEditPairs must cap at MAX_EDIT_PAIRS=16");
+    assert.equal(extractedPatch.length, 16, "extractPairsFromDiffText must cap at MAX_EDIT_PAIRS=16");
+    assert.equal(merged.length, 16, "mergeEditPairs must cap at MAX_EDIT_PAIRS=16");
+    assert.equal(patchRes.appliedCount, 16);
+    assert.ok(
+      elapsedMs < 20,
+      `Expected strictly linear O(N) runtime < 20ms on 20KB+ / 100-edit inputs, got ${elapsedMs}ms`,
+    );
   });
 });

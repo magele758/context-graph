@@ -1,4 +1,8 @@
 import {
+  extractPairsFromDiffText,
+  formatEditPairsAsDiff,
+} from "./artifact-engine.ts";
+import {
   compactCodeExcerpt,
   compactCommandExcerpt,
   sanitizeNeutralText,
@@ -15,6 +19,7 @@ import {
   type CompileOptions,
   type CompileResult,
   type ConflictWarning,
+  type EditReplacementPair,
   type ExcludedNodeEntry,
   type GraphEdge,
   type GraphNode,
@@ -329,6 +334,168 @@ function collapseNewlinesToSpace(text: string): string {
     .join(" ");
 }
 
+/**
+ * Strictly linear O(N), zero-regex helper that patches `baseContent` in-place
+ * using literal `indexOf` + `slice` concatenation (completely immune to ReDoS
+ * and JS `String.replace` `$&` / `$$` replacement-pattern interpolation).
+ */
+export function applyEditPairsToText(
+  baseContent: string,
+  pairs: readonly EditReplacementPair[],
+): {
+  patched: string;
+  appliedCount: number;
+  unappliedPairs: EditReplacementPair[];
+} {
+  let current = baseContent.includes("\r") ? baseContent.replace(/\r\n?/g, "\n") : baseContent;
+  let appliedCount = 0;
+  const unappliedPairs: EditReplacementPair[] = [];
+
+  for (const pair of pairs) {
+    const oldText = pair.oldText.includes("\r") ? pair.oldText.replace(/\r\n?/g, "\n") : pair.oldText;
+    const newText = pair.newText.includes("\r") ? pair.newText.replace(/\r\n?/g, "\n") : pair.newText;
+    if (!oldText) {
+      unappliedPairs.push(pair);
+      continue;
+    }
+
+    // 1. Exact literal substring match (never uses String.replace so `$&` / `$$` stay literal)
+    const exactIdx = current.indexOf(oldText);
+    if (exactIdx >= 0) {
+      current =
+        current.slice(0, exactIdx) +
+        newText +
+        current.slice(exactIdx + oldText.length);
+      appliedCount++;
+      continue;
+    }
+
+    // 2. Single-line trimmed / trailing-semicolon-normalized / literal line-substring match
+    if (!oldText.includes("\n") && !newText.includes("\n")) {
+      const oldTrim = oldText.trim();
+      const newTrim = newText.trim();
+      if (!oldTrim) {
+        unappliedPairs.push(pair);
+        continue;
+      }
+      const oldNoSemi = oldTrim.endsWith(";")
+        ? oldTrim.slice(0, -1).trimEnd()
+        : oldTrim;
+      const lines = current.split("\n");
+      let matched = false;
+
+      for (let j = 0; j < lines.length; j++) {
+        const line = lines[j]!;
+        const lineTrim = line.trim();
+        const lineNoSemi = lineTrim.endsWith(";")
+          ? lineTrim.slice(0, -1).trimEnd()
+          : lineTrim;
+        if (
+          lineTrim === oldTrim ||
+          (oldNoSemi.length >= 6 && lineNoSemi === oldNoSemi)
+        ) {
+          const indentLen = line.length - line.trimStart().length;
+          const indent = line.slice(0, indentLen);
+          if (newTrim.length > 0) {
+            lines[j] = `${indent}${newTrim}`;
+          } else {
+            lines.splice(j, 1);
+          }
+          current = lines.join("\n");
+          appliedCount++;
+          matched = true;
+          break;
+        }
+      }
+
+      if (!matched && oldTrim.length >= 4) {
+        for (let j = 0; j < lines.length; j++) {
+          const line = lines[j]!;
+          const pos = line.indexOf(oldTrim);
+          if (pos >= 0) {
+            lines[j] =
+              line.slice(0, pos) + newTrim + line.slice(pos + oldTrim.length);
+            current = lines.join("\n");
+            appliedCount++;
+            matched = true;
+            break;
+          }
+        }
+      }
+
+      if (!matched) {
+        unappliedPairs.push(pair);
+      }
+      continue;
+    }
+
+    // 3. Multi-line trimmed-line window match
+    const oldLines = oldText
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
+    if (oldLines.length > 0) {
+      const baseLines = current.split("\n");
+      let matchedStart = -1;
+      for (let j = 0; j + oldLines.length <= baseLines.length; j++) {
+        let allEq = true;
+        for (let k = 0; k < oldLines.length; k++) {
+          if (baseLines[j + k]!.trim() !== oldLines[k]) {
+            allEq = false;
+            break;
+          }
+        }
+        if (allEq) {
+          matchedStart = j;
+          break;
+        }
+      }
+      if (matchedStart >= 0) {
+        const firstLine = baseLines[matchedStart]!;
+        const indent = firstLine.slice(
+          0,
+          firstLine.length - firstLine.trimStart().length,
+        );
+        const replacementLines = newText
+          ? newText.split("\n").map((l) => (l.trim().length > 0 ? `${indent}${l.trimStart()}` : l))
+          : [];
+        baseLines.splice(matchedStart, oldLines.length, ...replacementLines);
+        current = baseLines.join("\n");
+        appliedCount++;
+        continue;
+      }
+    }
+
+    unappliedPairs.push(pair);
+  }
+
+  return { patched: current, appliedCount, unappliedPairs };
+}
+
+function extractPairsFromEditNode(editNode: GraphNode): {
+  pairs: EditReplacementPair[];
+  hasExplicitPairsMeta: boolean;
+} {
+  const raw = editNode.metadata.editPairs;
+  if (Array.isArray(raw)) {
+    const out: EditReplacementPair[] = [];
+    for (const item of raw) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+      const rec = item as Record<string, unknown>;
+      if (typeof rec.oldText === "string" && typeof rec.newText === "string") {
+        if (rec.oldText !== rec.newText && (rec.oldText.trim() || rec.newText.trim())) {
+          out.push({ oldText: rec.oldText, newText: rec.newText });
+        }
+      }
+    }
+    return { pairs: out, hasExplicitPairsMeta: true };
+  }
+  return {
+    pairs: extractPairsFromDiffText(editNode.content),
+    hasExplicitPairsMeta: false,
+  };
+}
+
 function flattenCodeLines(text: string): string {
   const lines = cleanCompactFragment(text)
     .split("\n")
@@ -582,6 +749,101 @@ function compileCompactMarkdown(args: CompactMarkdownBuildArgs): CompileResult {
     return Math.abs(diff) > 1e-12 ? diff : a.minSeq - b.minSeq;
   });
 
+  interface Tier2RenderItem {
+    nodes: GraphNode[];
+    primaryNode: GraphNode;
+    prefixOverride?: string;
+    contentOverride?: string;
+  }
+
+  const isBaseFileSnapshot = (n: GraphNode): boolean =>
+    isFileArtifactNode(n) &&
+    !isFileErrorNode(n) &&
+    n.metadata.fileOpKind !== "partial_edit" &&
+    n.metadata.fileOpKind !== "ranged_read" &&
+    !n.resourceKey?.endsWith("#edit") &&
+    !n.resourceKey?.includes("#range=");
+
+  const isPartialEditNode = (n: GraphNode): boolean =>
+    n.metadata.fileOpKind === "partial_edit" || Boolean(n.resourceKey?.endsWith("#edit"));
+
+  // Merge base snapshot + `#edit` delta in-place per file group to eliminate
+  // stale base poisoning and halve Tier 2 line consumption under tight budgets.
+  const tier2RenderItems: Tier2RenderItem[] = [];
+  for (const grp of tier2Groups) {
+    const baseNode = grp.nodes.find((n) => isBaseFileSnapshot(n));
+    const editNode = grp.nodes.find((n) => isPartialEditNode(n));
+
+    if (baseNode && editNode) {
+      const { pairs, hasExplicitPairsMeta } = extractPairsFromEditNode(editNode);
+      if (pairs.length === 0 && hasExplicitPairsMeta) {
+        // Reverted back to base state -> collapse to single merged entry
+        tier2RenderItems.push({
+          nodes: [baseNode, editNode],
+          primaryNode: baseNode,
+          prefixOverride: `- [file edited] \`${getFileDisplayPath(baseNode)}\`: `,
+          contentOverride: baseNode.content,
+        });
+        for (const extra of grp.nodes) {
+          if (extra !== baseNode && extra !== editNode) {
+            tier2RenderItems.push({ nodes: [extra], primaryNode: extra });
+          }
+        }
+        continue;
+      }
+
+      const { patched, appliedCount, unappliedPairs } = applyEditPairsToText(
+        baseNode.content,
+        pairs,
+      );
+
+      if (appliedCount > 0 && unappliedPairs.length === 0) {
+        // Case A: ALL edits patched cleanly into base -> ONE single merged `[file edited]` line!
+        tier2RenderItems.push({
+          nodes: [baseNode, editNode],
+          primaryNode: baseNode,
+          prefixOverride: `- [file edited] \`${getFileDisplayPath(baseNode)}\`: `,
+          contentOverride: patched,
+        });
+        for (const extra of grp.nodes) {
+          if (extra !== baseNode && extra !== editNode) {
+            tier2RenderItems.push({ nodes: [extra], primaryNode: extra });
+          }
+        }
+        continue;
+      }
+
+      if (appliedCount > 0 && unappliedPairs.length > 0) {
+        // Case B: partial in-place patch + deep-body unapplied edits -> patched base + remaining delta
+        for (const n of grp.nodes) {
+          if (n === baseNode) {
+            tier2RenderItems.push({
+              nodes: [baseNode],
+              primaryNode: baseNode,
+              prefixOverride: `- [file edited] \`${getFileDisplayPath(baseNode)}\`: `,
+              contentOverride: patched,
+            });
+          } else if (n === editNode) {
+            const remDiff = formatEditPairsAsDiff(unappliedPairs);
+            tier2RenderItems.push({
+              nodes: [editNode],
+              primaryNode: editNode,
+              contentOverride: remDiff || editNode.content,
+            });
+          } else {
+            tier2RenderItems.push({ nodes: [n], primaryNode: n });
+          }
+        }
+        continue;
+      }
+    }
+
+    // Case C: pure deep-body edit (`appliedCount === 0`), standalone `#edit`, ranged read, or decision
+    for (const n of grp.nodes) {
+      tier2RenderItems.push({ nodes: [n], primaryNode: n });
+    }
+  }
+
   const tier2Nodes: GraphNode[] = [];
   for (const grp of tier2Groups) {
     tier2Nodes.push(...grp.nodes);
@@ -704,10 +966,10 @@ function compileCompactMarkdown(args: CompactMarkdownBuildArgs): CompileResult {
   };
 
   // --- Tier 2: Edited scopes, #edit deltas, ranged chunks, failed-edit/failure-cited files, decisions ---
-  if (tier2Nodes.length > 0 && remainingChars >= 1) {
+  if (tier2RenderItems.length > 0 && remainingChars >= 1) {
     const previewOther = buildOtherReadFilesLine(140);
     const otherReserve =
-      previewOther && remainingChars - (previewOther.line.length + 1) >= tier2Nodes.length * 140
+      previewOther && remainingChars - (previewOther.line.length + 1) >= tier2RenderItems.length * 140
         ? previewOther.line.length + 1
         : 0;
     const tier2BudgetPool = Math.max(0, remainingChars - otherReserve);
@@ -733,30 +995,32 @@ function compileCompactMarkdown(args: CompactMarkdownBuildArgs): CompileResult {
       return `- [file] \`${pathLabel}\`: `;
     };
 
-    const renderTier2Body = (n: GraphNode, cap: number): string => {
+    const renderTier2Body = (item: Tier2RenderItem, cap: number): string => {
+      const n = item.primaryNode;
+      const rawContent = item.contentOverride ?? n.content;
       if (isFileErrorNode(n)) {
         const errCap = Math.min(cap, 180);
         return truncateAtWordBoundary(
-          flattenCommandLines(compactCommandExcerpt(n.content, false, errCap > 48 ? errCap - 6 : errCap)),
+          flattenCommandLines(compactCommandExcerpt(rawContent, false, errCap > 48 ? errCap - 6 : errCap)),
           cap,
         );
       }
       if (n.kind === "decision") {
         return truncateAtWordBoundary(
-          collapseNewlinesToSpace(cleanCompactFragment(n.content)),
+          collapseNewlinesToSpace(cleanCompactFragment(rawContent)),
           cap,
         );
       }
-      const codeEx = compactCodeExcerpt(n.content, cap);
+      const codeEx = compactCodeExcerpt(rawContent, cap);
       return truncateAtWordBoundary(flattenCodeLines(codeEx), cap);
     };
 
-    const tier2Entries = tier2Nodes.map((n) => {
-      const prefix = buildTier2Prefix(n);
-      const cap = isFileErrorNode(n) ? 140 : 240;
-      const desiredBody = renderTier2Body(n, cap);
+    const tier2Entries = tier2RenderItems.map((item) => {
+      const prefix = item.prefixOverride ?? buildTier2Prefix(item.primaryNode);
+      const cap = isFileErrorNode(item.primaryNode) ? 140 : 240;
+      const desiredBody = renderTier2Body(item, cap);
       return {
-        node: n,
+        item,
         prefix,
         desiredBody,
         desiredLen: prefix.length + desiredBody.length,
@@ -782,7 +1046,7 @@ function compileCompactMarkdown(args: CompactMarkdownBuildArgs): CompileResult {
             remainingChars - sep,
           );
           if (tiny) {
-            pushZone2Line({ tierRank: 2, text: tiny, nodes: [entry.node], lod: "stub" });
+            pushZone2Line({ tierRank: 2, text: tiny, nodes: entry.item.nodes, lod: "stub" });
           }
         }
         continue;
@@ -792,16 +1056,17 @@ function compileCompactMarkdown(args: CompactMarkdownBuildArgs): CompileResult {
       const body =
         exBudget >= entry.desiredBody.length
           ? entry.desiredBody
-          : renderTier2Body(entry.node, exBudget);
+          : renderTier2Body(entry.item, exBudget);
       if (!body) continue;
       const line = `${entry.prefix}${body}`;
-      const fullFlattenedLen = isFileArtifactNode(entry.node)
-        ? flattenCodeLines(entry.node.content).length
-        : cleanCompactFragment(entry.node.content).length;
+      const effectiveContent = entry.item.contentOverride ?? entry.item.primaryNode.content;
+      const fullFlattenedLen = isFileArtifactNode(entry.item.primaryNode)
+        ? flattenCodeLines(effectiveContent).length
+        : cleanCompactFragment(effectiveContent).length;
       pushZone2Line({
         tierRank: 2,
         text: line,
-        nodes: [entry.node],
+        nodes: entry.item.nodes,
         lod: body.length >= fullFlattenedLen ? "full" : "summary",
       });
     }
