@@ -334,10 +334,64 @@ function collapseNewlinesToSpace(text: string): string {
     .join(" ");
 }
 
+function isWordCharCode(code: number): boolean {
+  return (
+    (code >= 48 && code <= 57) || // 0-9
+    (code >= 65 && code <= 90) || // A-Z
+    (code >= 97 && code <= 122) || // a-z
+    code === 95 // _
+  );
+}
+
+function isCommentTrimmedLine(trimmed: string): boolean {
+  return (
+    trimmed.startsWith("//") ||
+    trimmed.startsWith("#") ||
+    trimmed.startsWith("/*") ||
+    trimmed.startsWith("*") ||
+    trimmed.startsWith("--")
+  );
+}
+
+function stripTrailingSemi(trimmed: string): string {
+  return trimmed.endsWith(";") ? trimmed.slice(0, -1).trimEnd() : trimmed;
+}
+
+/**
+ * Zero-regex, strictly linear O(N) search for a literal `needle` respecting
+ * `[A-Za-z0-9_]` identifier/number boundaries on whichever ends of `needle`
+ * start or end with a word character.
+ */
+function findBoundarySafeLiteral(
+  haystack: string,
+  needle: string,
+  fromIndex = 0,
+): number {
+  const nLen = needle.length;
+  if (nLen === 0 || fromIndex < 0 || fromIndex > haystack.length) return -1;
+  const checkLeft = isWordCharCode(needle.charCodeAt(0));
+  const checkRight = isWordCharCode(needle.charCodeAt(nLen - 1));
+  let pos = fromIndex;
+  while (pos <= haystack.length - nLen) {
+    const idx = haystack.indexOf(needle, pos);
+    if (idx < 0) return -1;
+    const leftOk =
+      !checkLeft || idx === 0 || !isWordCharCode(haystack.charCodeAt(idx - 1));
+    const rightOk =
+      !checkRight ||
+      idx + nLen >= haystack.length ||
+      !isWordCharCode(haystack.charCodeAt(idx + nLen));
+    if (leftOk && rightOk) return idx;
+    pos = idx + 1;
+  }
+  return -1;
+}
+
 /**
  * Strictly linear O(N), zero-regex helper that patches `baseContent` in-place
- * using literal `indexOf` + `slice` concatenation (completely immune to ReDoS
- * and JS `String.replace` `$&` / `$$` replacement-pattern interpolation).
+ * using boundary-safe literal `indexOf` + `slice` concatenation (completely
+ * immune to ReDoS, JS `String.replace` `$&` / `$$` interpolation, partial
+ * identifier/number corruption, comment clobbering, and ambiguous multi-matches).
  */
 export function applyEditPairsToText(
   baseContent: string,
@@ -359,9 +413,109 @@ export function applyEditPairsToText(
       continue;
     }
 
-    // 1. Exact literal substring match (never uses String.replace so `$&` / `$$` stay literal)
-    const exactIdx = current.indexOf(oldText);
+    // 1. Single-line pairs: whole-line match first (skipping comment lines unless targeting a comment),
+    //    then unique boundary-safe inline literal match across non-comment lines.
+    if (!oldText.includes("\n") && !newText.includes("\n")) {
+      const oldTrim = oldText.trim();
+      const newTrim = newText.trim();
+      if (!oldTrim) {
+        unappliedPairs.push(pair);
+        continue;
+      }
+      const oldIsComment = isCommentTrimmedLine(oldTrim);
+      const oldNoSemi = stripTrailingSemi(oldTrim);
+      const lines = current.split("\n");
+
+      // Pass 1: Whole-line trimmed or trailing-semicolon-normalized equality
+      let wholeMatchIdx = -1;
+      let wholeMatchCount = 0;
+      for (let j = 0; j < lines.length; j++) {
+        const lineTrim = lines[j]!.trim();
+        if (!oldIsComment && isCommentTrimmedLine(lineTrim)) continue;
+        const lineNoSemi = stripTrailingSemi(lineTrim);
+        if (
+          lineTrim === oldTrim ||
+          (oldNoSemi.length > 0 && lineNoSemi === oldNoSemi)
+        ) {
+          wholeMatchIdx = j;
+          wholeMatchCount++;
+          if (wholeMatchCount > 1) break;
+        }
+      }
+
+      if (wholeMatchCount === 1) {
+        const line = lines[wholeMatchIdx]!;
+        const lineTrim = line.trim();
+        const indentLen = line.length - line.trimStart().length;
+        const indent = line.slice(0, indentLen);
+        if (newTrim.length > 0) {
+          const keepSemi =
+            lineTrim.endsWith(";") && !oldTrim.endsWith(";") && !newTrim.endsWith(";");
+          lines[wholeMatchIdx] = `${indent}${newTrim}${keepSemi ? ";" : ""}`;
+        } else {
+          lines.splice(wholeMatchIdx, 1);
+        }
+        current = lines.join("\n");
+        appliedCount++;
+        continue;
+      }
+
+      if (wholeMatchCount > 1) {
+        // Ambiguous duplicate whole-line match -> refuse to guess
+        unappliedPairs.push(pair);
+        continue;
+      }
+
+      // Pass 2: Unique boundary-safe inline literal on non-comment lines (oldTrim.length >= 4)
+      if (oldTrim.length >= 4) {
+        let inlineMatchLine = -1;
+        let inlineMatchPos = -1;
+        let inlineMatchCount = 0;
+
+        for (let j = 0; j < lines.length; j++) {
+          const line = lines[j]!;
+          const lineTrim = line.trim();
+          if (!oldIsComment && isCommentTrimmedLine(lineTrim)) continue;
+          const pos = findBoundarySafeLiteral(line, oldTrim, 0);
+          if (pos >= 0) {
+            inlineMatchLine = j;
+            inlineMatchPos = pos;
+            inlineMatchCount++;
+            if (
+              inlineMatchCount > 1 ||
+              findBoundarySafeLiteral(line, oldTrim, pos + 1) >= 0
+            ) {
+              inlineMatchCount = 2;
+              break;
+            }
+          }
+        }
+
+        if (inlineMatchCount === 1) {
+          const line = lines[inlineMatchLine]!;
+          lines[inlineMatchLine] =
+            line.slice(0, inlineMatchPos) +
+            newTrim +
+            line.slice(inlineMatchPos + oldTrim.length);
+          current = lines.join("\n");
+          appliedCount++;
+          continue;
+        }
+      }
+
+      unappliedPairs.push(pair);
+      continue;
+    }
+
+    // 2. Multi-line pairs: unique boundary-safe literal match first
+    const exactIdx = findBoundarySafeLiteral(current, oldText, 0);
     if (exactIdx >= 0) {
+      const secondIdx = findBoundarySafeLiteral(current, oldText, exactIdx + 1);
+      if (secondIdx >= 0) {
+        // Ambiguous duplicate multi-line match -> refuse to guess
+        unappliedPairs.push(pair);
+        continue;
+      }
       current =
         current.slice(0, exactIdx) +
         newText +
@@ -370,66 +524,7 @@ export function applyEditPairsToText(
       continue;
     }
 
-    // 2. Single-line trimmed / trailing-semicolon-normalized / literal line-substring match
-    if (!oldText.includes("\n") && !newText.includes("\n")) {
-      const oldTrim = oldText.trim();
-      const newTrim = newText.trim();
-      if (!oldTrim) {
-        unappliedPairs.push(pair);
-        continue;
-      }
-      const oldNoSemi = oldTrim.endsWith(";")
-        ? oldTrim.slice(0, -1).trimEnd()
-        : oldTrim;
-      const lines = current.split("\n");
-      let matched = false;
-
-      for (let j = 0; j < lines.length; j++) {
-        const line = lines[j]!;
-        const lineTrim = line.trim();
-        const lineNoSemi = lineTrim.endsWith(";")
-          ? lineTrim.slice(0, -1).trimEnd()
-          : lineTrim;
-        if (
-          lineTrim === oldTrim ||
-          (oldNoSemi.length >= 6 && lineNoSemi === oldNoSemi)
-        ) {
-          const indentLen = line.length - line.trimStart().length;
-          const indent = line.slice(0, indentLen);
-          if (newTrim.length > 0) {
-            lines[j] = `${indent}${newTrim}`;
-          } else {
-            lines.splice(j, 1);
-          }
-          current = lines.join("\n");
-          appliedCount++;
-          matched = true;
-          break;
-        }
-      }
-
-      if (!matched && oldTrim.length >= 4) {
-        for (let j = 0; j < lines.length; j++) {
-          const line = lines[j]!;
-          const pos = line.indexOf(oldTrim);
-          if (pos >= 0) {
-            lines[j] =
-              line.slice(0, pos) + newTrim + line.slice(pos + oldTrim.length);
-            current = lines.join("\n");
-            appliedCount++;
-            matched = true;
-            break;
-          }
-        }
-      }
-
-      if (!matched) {
-        unappliedPairs.push(pair);
-      }
-      continue;
-    }
-
-    // 3. Multi-line trimmed-line window match
+    // 3. Multi-line trimmed-line window match (must also be unique across the file)
     const oldLines = oldText
       .split("\n")
       .map((l) => l.trim())
@@ -437,6 +532,7 @@ export function applyEditPairsToText(
     if (oldLines.length > 0) {
       const baseLines = current.split("\n");
       let matchedStart = -1;
+      let windowMatchCount = 0;
       for (let j = 0; j + oldLines.length <= baseLines.length; j++) {
         let allEq = true;
         for (let k = 0; k < oldLines.length; k++) {
@@ -447,10 +543,11 @@ export function applyEditPairsToText(
         }
         if (allEq) {
           matchedStart = j;
-          break;
+          windowMatchCount++;
+          if (windowMatchCount > 1) break;
         }
       }
-      if (matchedStart >= 0) {
+      if (windowMatchCount === 1) {
         const firstLine = baseLines[matchedStart]!;
         const indent = firstLine.slice(
           0,

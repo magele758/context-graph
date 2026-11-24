@@ -3620,4 +3620,113 @@ describe("v0.2.4 Chained Partial-Edit Accumulation, In-Place Merge & Tight-Diff 
       `Expected strictly linear O(N) runtime < 20ms on 20KB+ / 100-edit inputs, got ${elapsedMs}ms`,
     );
   });
+
+  it("62. [B1 & NB1] enforces word/number boundaries, skips comments, and leaves ambiguous multi-matches in unappliedPairs", () => {
+    // 1. Left identifier boundary: `PORT = 8080 -> PORT = 9090` must NOT clobber `MAX_PORT = 8080`
+    const res1 = applyEditPairsToText(
+      "export const MAX_PORT = 8080;\nexport const PORT = 8080;",
+      [{ oldText: "PORT = 8080", newText: "PORT = 9090" }],
+    );
+    assert.equal(res1.appliedCount, 1);
+    assert.equal(res1.unappliedPairs.length, 0);
+    assert.equal(
+      res1.patched,
+      "export const MAX_PORT = 8080;\nexport const PORT = 9090;",
+    );
+
+    // 2. Right digit & left identifier boundaries: `TIMEOUT = 100 -> TIMEOUT = 250`
+    //    must NOT clobber `TIMEOUT = 1000` (into `2500`) OR `MIN_TIMEOUT = 100`
+    const res2NoMatch = applyEditPairsToText(
+      "export const TIMEOUT = 1000;\nexport const MIN_TIMEOUT = 100;",
+      [{ oldText: "TIMEOUT = 100", newText: "TIMEOUT = 250" }],
+    );
+    assert.equal(res2NoMatch.appliedCount, 0);
+    assert.equal(res2NoMatch.unappliedPairs.length, 1);
+    assert.equal(
+      res2NoMatch.patched,
+      "export const TIMEOUT = 1000;\nexport const MIN_TIMEOUT = 100;",
+    );
+
+    const res2Exact = applyEditPairsToText(
+      "export const TIMEOUT = 1000;\nexport const MIN_TIMEOUT = 100;\nexport const TIMEOUT = 100;",
+      [{ oldText: "TIMEOUT = 100", newText: "TIMEOUT = 250" }],
+    );
+    assert.equal(res2Exact.appliedCount, 1);
+    assert.equal(
+      res2Exact.patched,
+      "export const TIMEOUT = 1000;\nexport const MIN_TIMEOUT = 100;\nexport const TIMEOUT = 250;",
+    );
+
+    // 3. Word boundary inside keywords: `port -> bindPort` must NOT corrupt `import` into `imbindPort`
+    const res3 = applyEditPairsToText(
+      "import { createServer } from 'node:http';\nexport const port = 3000;",
+      [{ oldText: "port", newText: "bindPort" }],
+    );
+    assert.equal(res3.appliedCount, 1);
+    assert.equal(res3.unappliedPairs.length, 0);
+    assert.equal(
+      res3.patched,
+      "import { createServer } from 'node:http';\nexport const bindPort = 3000;",
+    );
+
+    // 4. Comment skipping: `true -> false` skips `// returns true when enabled` and patches `ENABLED = true`
+    const res4 = applyEditPairsToText(
+      "// returns true when enabled\n# also true in yaml\nexport const ENABLED = true;",
+      [{ oldText: "true", newText: "false" }],
+    );
+    assert.equal(res4.appliedCount, 1);
+    assert.equal(res4.unappliedPairs.length, 0);
+    assert.equal(
+      res4.patched,
+      "// returns true when enabled\n# also true in yaml\nexport const ENABLED = false;",
+    );
+
+    // 5. Ambiguity guard [NB1]: duplicate whole-line, inline, and multi-line occurrences stay in unappliedPairs
+    const dupBlocks = [
+      "export const HTTP_CFG = {",
+      "  retries: 3,",
+      "};",
+      "export const GRPC_CFG = {",
+      "  retries: 3,",
+      "};",
+    ].join("\n");
+
+    const res5Whole = applyEditPairsToText(dupBlocks, [
+      { oldText: "retries: 3,", newText: "retries: 5," },
+    ]);
+    assert.equal(res5Whole.appliedCount, 0);
+    assert.equal(res5Whole.unappliedPairs.length, 1);
+    assert.equal(res5Whole.patched, dupBlocks, "Ambiguous whole-line match must leave text untouched");
+
+    const res5Inline = applyEditPairsToText(dupBlocks, [
+      { oldText: "retries: 3", newText: "retries: 5" },
+    ]);
+    assert.equal(res5Inline.appliedCount, 0);
+    assert.equal(res5Inline.unappliedPairs.length, 1);
+    assert.equal(res5Inline.patched, dupBlocks, "Ambiguous inline match must leave text untouched");
+
+    const dupMulti = "const a = 1;\nconst b = 2;\n// sep\nconst a = 1;\nconst b = 2;";
+    const res5Multi = applyEditPairsToText(dupMulti, [
+      { oldText: "const a = 1;\nconst b = 2;", newText: "const a = 9;\nconst b = 9;" },
+    ]);
+    assert.equal(res5Multi.appliedCount, 0);
+    assert.equal(res5Multi.unappliedPairs.length, 1);
+    assert.equal(res5Multi.patched, dupMulti, "Ambiguous multi-line match must leave text untouched");
+
+    // 6. Linear O(N) performance (< 20ms) on 20KB+ repeated false-boundary haystack
+    const falseBoundaryHaystack =
+      "import_port_export_".repeat(1_200) + "\nexport const port = 443;";
+    const t0 = Date.now();
+    const perfRes = applyEditPairsToText(falseBoundaryHaystack, [
+      { oldText: "port", newText: "bindPort" },
+    ]);
+    const elapsedMs = Date.now() - t0;
+    assert.equal(perfRes.appliedCount, 1);
+    assert.ok(perfRes.patched.endsWith("\nexport const bindPort = 443;"));
+    assert.ok(perfRes.patched.startsWith("import_port_export_"));
+    assert.ok(
+      elapsedMs < 20,
+      `Boundary-safe scan must remain strictly linear O(N) < 20ms on 22KB input, got ${elapsedMs}ms`,
+    );
+  });
 });
