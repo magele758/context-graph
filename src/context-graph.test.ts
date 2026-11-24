@@ -2719,3 +2719,135 @@ describe("v0.2.1 Refinement Suite (V2.1-1, V2.1-2, V2.1-3)", () => {
     store.close();
   });
 });
+
+describe("v0.2.2 Excerpt Ordering & Diff Preservation Suite (V2.2-1 & V2.2-2)", () => {
+  it("47. [V2.2-1] omits Vitest runner file banners and leads with Error diagnostic + non-test source frame", () => {
+    const vitestOut = [
+      "❯ src/foo.test.ts (18 tests | 1 failed) 42ms",
+      "  × rejects invalid digest header",
+      "    → Error [ERR_X]: digest verification failed for request payload",
+      "      at verifyPayload (src/foo.ts:94:15)",
+      "      at runTask (node_modules/vitest/dist/runner.js:412:9)",
+      "Test Files  1 failed (1)",
+      "Tests  1 failed | 17 passed (18)",
+    ].join("\n");
+
+    const excerpt = compactCommandExcerpt(vitestOut, false, 240);
+    assert.ok(excerpt.length <= 240, `Expected <= 240, got ${excerpt.length}`);
+    assert.ok(
+      !excerpt.includes("src/foo.test.ts (18 tests"),
+      `Must omit test-file summary count banner:\n${excerpt}`,
+    );
+    assert.ok(
+      excerpt.includes("Error [ERR_X]: digest verification failed"),
+      `Must preserve Error diagnostic:\n${excerpt}`,
+    );
+    assert.ok(
+      excerpt.includes("src/foo.ts:94:15"),
+      `Must preserve non-test implementation frame:\n${excerpt}`,
+    );
+    // Error diagnostic MUST appear ahead of any test-case path
+    const errIdx = excerpt.indexOf("Error [ERR_X]");
+    const frameIdx = excerpt.indexOf("src/foo.ts:94:15");
+    assert.ok(errIdx >= 0 && frameIdx > errIdx, `Expected Error -> impl source order:\n${excerpt}`);
+
+    // Pure banner + error + frame (no intermediate `×` line): literally starts with Error [ERR_X]
+    const vitestDirect = [
+      "❯ src/foo.test.ts (18 tests | 1 failed)",
+      "  → Error [ERR_X]: signature mismatch",
+      "    at fn (src/foo.ts:94:15)",
+    ].join("\n");
+    const directEx = compactCommandExcerpt(vitestDirect, false, 200);
+    assert.ok(directEx.startsWith("Error [ERR_X]:"), `Expected excerpt to lead with Error:\n${directEx}`);
+    assert.ok(directEx.includes("src/foo.ts:94:15"));
+    assert.ok(!directEx.includes("src/foo.test.ts"));
+  });
+
+  it("48. [V2.2-1] strips test-file prefix from Go Error diagnostics and pairs TestFoo + Error + non-test source", () => {
+    const goOut = [
+      "--- FAIL: TestFoo (0.19s)",
+      "    foo_test.go:84: Error [ERR_Y]: queue worker stalled during flush",
+      "    pkg/mod/foo.go:118 +0x1c4",
+      "FAIL\tgithub.com/example/mod/pkg/mod\t0.214s",
+    ].join("\n");
+
+    const excerpt = compactCommandExcerpt(goOut, false, 220);
+    assert.ok(excerpt.length <= 220, `Expected <= 220, got ${excerpt.length}`);
+    assert.ok(excerpt.includes("--- FAIL: TestFoo"), `Must keep named Go test:\n${excerpt}`);
+    assert.ok(!excerpt.includes("(0.19s)"), `Should strip timing noise:\n${excerpt}`);
+    assert.ok(
+      excerpt.includes("Error [ERR_Y]: queue worker stalled during flush"),
+      `Must keep clean Error diagnostic:\n${excerpt}`,
+    );
+    assert.ok(
+      !excerpt.includes("foo_test.go:84:"),
+      `Must strip leading test-file prefix when non-test source frame exists:\n${excerpt}`,
+    );
+    assert.ok(
+      excerpt.includes("pkg/mod/foo.go:118"),
+      `Must preserve non-test implementation source frame:\n${excerpt}`,
+    );
+    assert.ok(!excerpt.includes("+0x1c4"), `Should strip noisy hex PC offset:\n${excerpt}`);
+  });
+
+  it("49. [V2.2-2] always preserves + (new/replacement) lines in tight partial_edit diff excerpts", () => {
+    const longDiff = [
+      '- export const LEGACY_ENDPOINT_URL = "https://deprecated-v1.internal.service.local/api/dispatch/v1/legacy";',
+      '+ export const ACTIVE_ENDPOINT_URL = "https://v2.service.local/api/dispatch";',
+    ].join("\n");
+
+    // Direct diffText option under tight maxChars = 110
+    const viaOpt = compactCodeExcerpt("Edited src/client.ts", 110, { diffText: longDiff });
+    assert.ok(viaOpt.length <= 110, `Expected <= 110, got ${viaOpt.length}`);
+    assert.ok(
+      viaOpt.includes("+ export const ACTIVE_ENDPOINT_URL"),
+      `Must ALWAYS preserve + new replacement line under tight budget:\n${viaOpt}`,
+    );
+    assert.ok(
+      viaOpt.includes("https://v2.service.local/api/dispatch"),
+      `Full + replacement value should stay intact:\n${viaOpt}`,
+    );
+
+    // Re-excerpting a stored pure diff block (without opts.diffText) also preserves + lines
+    const viaStored = compactCodeExcerpt(longDiff, 110);
+    assert.ok(viaStored.length <= 110);
+    assert.ok(
+      viaStored.includes("+ export const ACTIVE_ENDPOINT_URL"),
+      `Stored diff re-excerpt must also preserve + replacement line:\n${viaStored}`,
+    );
+
+    // Both - and + very long (>140 chars each) under maxChars = 110: + still gets >= 65% of budget
+    const bothLongDiff = [
+      '- export const OLD_POLICY = { mode: "legacy_fallback", retryBackoffMs: 1200, maxAttempts: 4, strictHeaders: false, auditLog: "off" };',
+      '+ export const NEW_POLICY = { mode: "strict_primary", retryBackoffMs: 300, maxAttempts: 8, strictHeaders: true, auditLog: "on" };',
+    ].join("\n");
+    const bothCut = compactCodeExcerpt("", 110, { diffText: bothLongDiff });
+    assert.ok(bothCut.length <= 110);
+    assert.ok(
+      bothCut.includes("+ export const NEW_POLICY"),
+      `Both-long diff must allocate majority budget to + new line:\n${bothCut}`,
+    );
+  });
+
+  it("50. [V2.2 ReDoS] maintains strictly linear O(N) performance (< 10ms) on 20KB adversarial inputs", () => {
+    const inputs = [
+      " ".repeat(20_000) + "x",
+      "[".repeat(20_000),
+      "(".repeat(20_000),
+      "a".repeat(20_000),
+      "❯ " + "a".repeat(20_000),
+    ];
+    // Warm up JIT once before measuring
+    compactCommandExcerpt("x", false, 120);
+    compactCodeExcerpt("- a\n+ b", 120, { diffText: "- a\n+ b" });
+
+    const t0 = Date.now();
+    for (const s of inputs) {
+      sanitizeNeutralText(s);
+      compactCommandExcerpt(s, false, 200);
+      compactCodeExcerpt(s, 200, { diffText: s });
+    }
+    const elapsedMs = Date.now() - t0;
+    assert.ok(elapsedMs < 10, `Expected linear O(N) runtime < 10ms, got ${elapsedMs}ms`);
+  });
+});

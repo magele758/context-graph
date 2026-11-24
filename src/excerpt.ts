@@ -26,6 +26,15 @@ const REDUNDANT_CMD_SUMMARY_RE =
 const FAIL_HEADER_RE =
   /^(?:FAIL\b|FAILED\b|---\s*FAIL:|not\s+ok\s+\d|[\u2715\u2717\u2716\u00d7\u25cf\u276f]\s+\S|FAIL\s+\S)/;
 
+const RUNNER_FILE_BANNER_RE =
+  /^(?:(?:FAIL|FAILED)\s+|[\u276f\u2713\u2715\u2717\u2716\u00d7\u2022\u25cf]\s*)?[^\s()]+(?:\.(?:test|spec)\.[a-z0-9]+|_test\.[a-z0-9]+)\s*\(\d+\s+tests?\b[^)\n]*\)/i;
+
+const LEADING_TEST_FILE_PREFIX_RE =
+  /^[^\s():'"\n]+(?:\.(?:test|spec)\.[a-z0-9]+|_test\.[a-z0-9]+):\d+(?::\d+)?:\s+/i;
+
+const LEADING_ARROW_RE = /^(?:\u2192|->)[ \t]+/;
+const GO_FAIL_TIMING_RE = /^(---\s*FAIL:\s+\S+)[ \t]+\(\d+(?:\.\d+)?m?s\)$/;
+
 const ERROR_DIAG_RE =
   /(?:\b(?:AssertionError|TypeError|SyntaxError|ReferenceError|RangeError|URIError|EvalError|AggregateError)\b|\b[A-Z][A-Za-z0-9]*Error\b(?:\s*[:[(]|$)|\bError\s*[:[(]|\b(?:error|fatal)\s*:|\bERR_[A-Z0-9_]+\b|\bE(?:CONNREFUSED|CONNRESET|TIMEDOUT|NOENT|ACCES|ADDRINUSE|PIPE|PERM|EXIST|NOTDIR|ISDIR)\b|^(?:Expected|Received|Actual|Diff|Message|Cause|panic|Traceback|Exception|Assertion\s+failed)\s*[:(]|\berror\s+TS\d+:|\berror\[E\d+\]:)/;
 
@@ -430,7 +439,7 @@ export function compactCodeExcerpt(
   if (opts?.diffText && opts.diffText.trim().length > 0) {
     const cleanDiff = stripBoilerplateAcks(sanitizeNeutralText(opts.diffText));
     if (cleanDiff.length > 0) {
-      return packLinesSequentially(cleanDiff.split("\n"), cap);
+      return packDiffLines(cleanDiff.split("\n"), cap);
     }
   }
 
@@ -445,6 +454,12 @@ export function compactCodeExcerpt(
     .map((l) => trimHorizontalEnd(l))
     .filter((l) => l.trim().length > 0);
   if (rawLines.length === 0) return "";
+
+  // If `content` itself is a stored diff block (containing both `-` and `+` lines),
+  // preserve `+` replacement lines ahead of `-` removed lines under tight budgets.
+  if (isPureDiffBlock(rawLines)) {
+    return packDiffLines(rawLines, cap);
+  }
 
   const hasGutter = detectLineNumberGutter(rawLines);
   const classified = rawLines.map((line, idx) => ({
@@ -529,6 +544,92 @@ export function compactCodeExcerpt(
   return joined.length <= cap ? joined : truncateAtWordBoundary(joined, cap);
 }
 
+function isPureDiffBlock(lines: readonly string[]): boolean {
+  let hasRemoved = false;
+  let hasAdded = false;
+  for (const line of lines) {
+    const trimmed = line.trimStart();
+    if (trimmed.startsWith("-") && !trimmed.startsWith("---")) {
+      hasRemoved = true;
+    } else if (trimmed.startsWith("+") && !trimmed.startsWith("+++")) {
+      hasAdded = true;
+    } else {
+      return false;
+    }
+  }
+  return hasRemoved && hasAdded;
+}
+
+/**
+ * Packs diff lines within `maxChars` while guaranteeing that `+` (added/new)
+ * replacement lines are NEVER dropped to keep `-` (removed/old) lines.
+ * Allocates at least 65% of `maxChars` to `+` lines (up to 100% when tight).
+ */
+function packDiffLines(lines: readonly string[], maxChars: number): string {
+  const nonEmpty = lines.map((l) => trimHorizontalEnd(l)).filter((l) => l.trim().length > 0);
+  if (nonEmpty.length === 0) return "";
+  const full = nonEmpty.join("\n");
+  if (full.length <= maxChars) return full;
+
+  const removedLines: string[] = [];
+  const addedLines: string[] = [];
+  for (const line of nonEmpty) {
+    const trimmed = line.trimStart();
+    if (trimmed.startsWith("-") && !trimmed.startsWith("---")) {
+      removedLines.push(line);
+    } else if (trimmed.startsWith("+") && !trimmed.startsWith("+++")) {
+      addedLines.push(line);
+    }
+  }
+
+  if (addedLines.length === 0 || removedLines.length === 0) {
+    return packLinesSequentially(nonEmpty, maxChars);
+  }
+
+  // Always preserve `+` replacement lines: give them at least 65% of maxChars.
+  const minAddedBudget = Math.ceil(maxChars * 0.65);
+  const fullAdded = packLinesSequentially(addedLines, maxChars);
+
+  // If all `+` lines fit with comfortable room for a `-` context line, include both
+  if (fullAdded.length <= maxChars - 24) {
+    const remForRemoved = maxChars - fullAdded.length - 1;
+    const compactRemoved = packLinesSequentially(removedLines, remForRemoved);
+    if (compactRemoved.length > 0 && compactRemoved.length + 1 + fullAdded.length <= maxChars) {
+      return `${compactRemoved}\n${fullAdded}`;
+    }
+    return fullAdded;
+  }
+
+  // Tight budget: reserve at least 65% for `+` lines; include compact `-` only if budget allows
+  const maxRemovedBudget = maxChars - minAddedBudget - 1;
+  if (maxChars >= 48 && maxRemovedBudget >= 18) {
+    const compactRemoved = packLinesSequentially(removedLines, maxRemovedBudget);
+    if (compactRemoved.length > 0) {
+      const addedBudget = maxChars - compactRemoved.length - 1;
+      const compactAdded = packLinesSequentially(addedLines, addedBudget);
+      if (compactAdded.length > 0 && compactRemoved.length + 1 + compactAdded.length <= maxChars) {
+        return `${compactRemoved}\n${compactAdded}`;
+      }
+    }
+  }
+
+  return fullAdded;
+}
+
+function stripTrailingHexOffset(line: string): string {
+  const idx = line.lastIndexOf("+0x");
+  if (idx <= 1) return line;
+  const beforeChar = line.charCodeAt(idx - 1);
+  if (beforeChar !== 32 && beforeChar !== 9) return line;
+  for (let i = idx + 3; i < line.length; i++) {
+    const c = line.charCodeAt(i);
+    const isHex =
+      (c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102);
+    if (!isHex) return line;
+  }
+  return idx + 3 < line.length ? trimHorizontalEnd(line.slice(0, idx)) : line;
+}
+
 function packLinesSequentially(lines: readonly string[], maxChars: number): string {
   const nonEmpty = lines.map((l) => trimHorizontalEnd(l)).filter((l) => l.trim().length > 0);
   if (nonEmpty.length === 0) return "";
@@ -606,31 +707,42 @@ export function compactCommandExcerpt(
   const workingLines = nonVendorLines.length > 0 ? nonVendorLines : allLines;
 
   const headers: string[] = [];
+  const runnerBanners: string[] = [];
   const diagnostics: string[] = [];
   const appFrames: string[] = [];
   const fallback: string[] = [];
 
   for (const line of workingLines) {
     const isRedundantSummary = REDUNDANT_CMD_SUMMARY_RE.test(line);
+    if (!isRedundantSummary && RUNNER_FILE_BANNER_RE.test(line)) {
+      runnerBanners.push(line);
+      continue;
+    }
+
     const isExplicitStackLine = /^\s*(?:at\s+\S|File\s+"[^"\n]+",\s+line\s+\d+)/.test(line);
     const isHeader = FAIL_HEADER_RE.test(line) && !isRedundantSummary;
     const hasCitedPathWithLine =
       !isRedundantSummary && /:\d+/.test(line) && extractAppFileReferences(line).length > 0;
     const isFrame =
       (APP_STACK_FRAME_RE.test(line) && !isRedundantSummary) || hasCitedPathWithLine;
-    const isDiag = ERROR_DIAG_RE.test(line) && !isRedundantSummary;
+    const diagProbe = line
+      .replace(LEADING_ARROW_RE, "")
+      .replace(LEADING_TEST_FILE_PREFIX_RE, "");
+    const isDiag =
+      !isRedundantSummary && (ERROR_DIAG_RE.test(line) || ERROR_DIAG_RE.test(diagProbe));
 
     if (isExplicitStackLine && isFrame) {
       appFrames.push(line);
     } else if (isHeader) {
       // Check test/suite headers BEFORE diagnostics so test filenames like
       // `FAIL src/error-handler.test.ts` never displace real Error diagnostics.
-      headers.push(line);
+      const cleanHeader = line.replace(GO_FAIL_TIMING_RE, "$1");
+      headers.push(cleanHeader);
       if (isFrame && /\.\w+:\d+/.test(line)) {
         appFrames.push(line);
       }
     } else if (isDiag) {
-      diagnostics.push(line);
+      diagnostics.push(line.replace(LEADING_ARROW_RE, ""));
     } else if (isFrame) {
       appFrames.push(line);
     } else if (!isRedundantSummary) {
@@ -640,67 +752,93 @@ export function compactCommandExcerpt(
 
   // Strictly prefer a non-test application source frame (e.g. worker.go:118, jwt.ts:142)
   // over test harness frames (*_test.go, *.test.ts, *.spec.ts, test_*.py)
+  const nonTestFrameRaw = appFrames.find((f) => !TEST_FILE_FRAME_RE.test(f));
+  const rawPrimaryFrame = nonTestFrameRaw ?? appFrames[0];
+  const primaryFrame = rawPrimaryFrame ? stripTrailingHexOffset(rawPrimaryFrame) : undefined;
+  const hasNonTestFrame = Boolean(nonTestFrameRaw);
+
   const primaryHeader = headers[0];
-  const primaryDiag = diagnostics[0];
-  const primaryFrame =
-    appFrames.find((f) => !TEST_FILE_FRAME_RE.test(f)) ?? appFrames[0];
+  let primaryDiag = diagnostics[0];
+  if (primaryDiag && hasNonTestFrame && LEADING_TEST_FILE_PREFIX_RE.test(primaryDiag)) {
+    const strippedDiag = primaryDiag.replace(LEADING_TEST_FILE_PREFIX_RE, "").trim();
+    if (strippedDiag.length > 0) {
+      primaryDiag = strippedDiag;
+    }
+  }
 
   // If no structured failure signals were found, fall back cleanly to non-summary lines
   if (!primaryHeader && !primaryDiag && !primaryFrame) {
-    const pool = fallback.length > 0 ? fallback : workingLines;
+    const pool =
+      fallback.length > 0 ? fallback : runnerBanners.length > 0 ? runnerBanners : workingLines;
     return packLinesSequentially(pool, cap);
   }
 
-  // Build priority-ordered bundle guaranteeing diagnostic + app source frame are never starved
-  const essential: Array<{ role: "header" | "diag" | "frame"; text: string }> = [];
-  if (primaryHeader) essential.push({ role: "header", text: primaryHeader });
-  if (primaryDiag) essential.push({ role: "diag", text: primaryDiag });
-  if (primaryFrame && primaryFrame !== primaryDiag && primaryFrame !== primaryHeader) {
-    essential.push({ role: "frame", text: primaryFrame });
-  }
+  // Order parts so Error diagnostic + non-test implementation source are NEVER obscured
+  // behind a `*.test.ts` / `*_test.go` path; keep named non-file headers (e.g. `--- FAIL: TestFoo`)
+  // at the front and place test-file headers after diagnostic + app frame when space allows.
+  const headerMentionsTestFile = Boolean(primaryHeader && TEST_FILE_FRAME_RE.test(primaryHeader));
+  const leadHeader = primaryHeader && !headerMentionsTestFile ? primaryHeader : undefined;
+  const trailingHeader =
+    primaryHeader && headerMentionsTestFile && primaryDiag ? primaryHeader : undefined;
+  const fallbackOnlyHeader =
+    primaryHeader && headerMentionsTestFile && !primaryDiag ? primaryHeader : undefined;
+
+  const essential: string[] = [];
+  const pushUnique = (list: string[], value: string | undefined) => {
+    if (value && !list.includes(value)) list.push(value);
+  };
+
+  pushUnique(essential, leadHeader ?? fallbackOnlyHeader);
+  pushUnique(essential, primaryDiag);
+  pushUnique(essential, primaryFrame);
+  pushUnique(essential, trailingHeader);
 
   const joinParts = (parts: readonly string[]) => parts.join("\n");
-  const essentialTexts = essential.map((e) => e.text);
 
-  if (joinParts(essentialTexts).length <= cap) {
+  if (joinParts(essential).length <= cap) {
     // Everything essential fits! Greedily include secondary diagnostics (e.g. Expected / Received)
     const chosen: string[] = [];
-    if (primaryHeader) chosen.push(primaryHeader);
-    if (primaryDiag) chosen.push(primaryDiag);
+    pushUnique(chosen, leadHeader ?? fallbackOnlyHeader);
+    pushUnique(chosen, primaryDiag);
 
-    const frameReserve =
-      primaryFrame && primaryFrame !== primaryDiag && primaryFrame !== primaryHeader
-        ? primaryFrame.length + 1
-        : 0;
+    const tailItems: string[] = [];
+    pushUnique(tailItems, primaryFrame);
+    pushUnique(tailItems, trailingHeader);
+    const tailReserve =
+      tailItems.filter((t) => !chosen.includes(t)).reduce((acc, t) => acc + t.length + 1, 0);
     let currentLen = joinParts(chosen).length;
 
     for (let i = 1; i < diagnostics.length && i < 4; i++) {
-      const extra = diagnostics[i]!;
-      if (chosen.includes(extra) || extra === primaryFrame) continue;
+      let extra = diagnostics[i]!;
+      if (hasNonTestFrame && LEADING_TEST_FILE_PREFIX_RE.test(extra)) {
+        const cleaned = extra.replace(LEADING_TEST_FILE_PREFIX_RE, "").trim();
+        if (cleaned) extra = cleaned;
+      }
+      if (chosen.includes(extra) || tailItems.includes(extra)) continue;
       const nextLen = currentLen + (chosen.length > 0 ? 1 : 0) + extra.length;
-      if (nextLen + frameReserve <= cap) {
+      if (nextLen + tailReserve <= cap) {
         chosen.push(extra);
         currentLen = nextLen;
       }
     }
 
-    if (primaryFrame && !chosen.includes(primaryFrame)) {
-      chosen.push(primaryFrame);
-    }
+    for (const t of tailItems) pushUnique(chosen, t);
     return joinParts(chosen);
   }
 
   // Tight budget: protect primaryDiag and primaryFrame first; shrink or drop header if needed
   const coreWithoutHeader: string[] = [];
-  if (primaryDiag) coreWithoutHeader.push(primaryDiag);
-  if (primaryFrame && primaryFrame !== primaryDiag) coreWithoutHeader.push(primaryFrame);
+  pushUnique(coreWithoutHeader, primaryDiag);
+  pushUnique(coreWithoutHeader, primaryFrame);
 
   if (primaryHeader && coreWithoutHeader.length > 0) {
     const coreLen = joinParts(coreWithoutHeader).length;
     const remForHeader = cap - coreLen - 1;
     if (remForHeader >= 28) {
       const shortHeader = truncateAtWordBoundary(primaryHeader, remForHeader);
-      return joinParts([shortHeader, ...coreWithoutHeader]);
+      return headerMentionsTestFile
+        ? joinParts([...coreWithoutHeader, shortHeader])
+        : joinParts([shortHeader, ...coreWithoutHeader]);
     }
     if (coreLen <= cap) {
       return joinParts(coreWithoutHeader);
