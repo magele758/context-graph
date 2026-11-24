@@ -3130,4 +3130,65 @@ describe("v0.2.3 Code Excerpt, Go Frame Pairing & Lossless Vendor Stripping Suit
       `Expected strictly linear O(N) runtime < 20ms on 20KB+ / 5000-line inputs, got ${elapsedMs}ms`,
     );
   });
+
+  it("56. [NB1] keeps OpenAPI/K8s YAML keys like type/interface/class at P1 without falsely triggering hasCodeDecls", () => {
+    const k8sOpenApiYaml = [
+      "title: gateway",
+      "type: object",
+      "interface: eth0",
+      "class: ingress",
+      "replicas: 3",
+      "const: v2",
+      "description: |",
+      "  " + "verbose trailing documentation block ".repeat(14),
+    ].join("\n");
+
+    const excerpt = compactCodeExcerpt(k8sOpenApiYaml, 140);
+    assert.ok(excerpt.length <= 140, `Expected <= 140, got ${excerpt.length}`);
+    assert.ok(excerpt.includes("title: gateway"), `Missing sibling YAML key:\n${excerpt}`);
+    assert.ok(excerpt.includes("type: object"), `Missing type YAML key:\n${excerpt}`);
+    assert.ok(excerpt.includes("interface: eth0"), `Missing interface YAML key:\n${excerpt}`);
+    assert.ok(excerpt.includes("class: ingress"), `Missing class YAML key:\n${excerpt}`);
+    assert.ok(excerpt.includes("replicas: 3"), `Missing replicas YAML key:\n${excerpt}`);
+    assert.ok(!excerpt.includes("verbose trailing documentation"), `Trailing prose should not crowd YAML keys:\n${excerpt}`);
+  });
+
+  it("57. [NB2] preserves user app runtime/ paths while still stripping Go stdlib runtime frames", () => {
+    const mixedOutput = [
+      "FAIL runtime/scheduler.test.ts > dispatches queued job",
+      "  Error [ERR_SCHED_FAIL]: worker slot exhausted",
+      "    runtime/scheduler.ts:10",
+      "    runtime.gopark(0x104a, 0xc00012a000)",
+      "    runtime/proc.go:381 +0x12",
+      "    runtime/debug.Stack()",
+      "    runtime/asm_amd64.s:1650 +0x1",
+    ].join("\n");
+
+    const stripped = stripVendorStackFrames(mixedOutput);
+    assert.equal(stripped.strippedLines, 4);
+    assert.ok(
+      stripped.text.includes("runtime/scheduler.ts:10"),
+      `User app path runtime/scheduler.ts:10 must be preserved:\n${stripped.text}`,
+    );
+    assert.ok(!stripped.text.includes("runtime.gopark"), "Go runtime.gopark must be stripped");
+    assert.ok(!stripped.text.includes("runtime/proc.go:381"), "Go runtime/proc.go must be stripped");
+    assert.ok(!stripped.text.includes("runtime/debug.Stack"), "Go runtime/debug.Stack must be stripped");
+    assert.ok(!stripped.text.includes("runtime/asm_amd64.s"), "Go runtime/asm_amd64.s must be stripped");
+
+    const excerpt = compactCommandExcerpt(mixedOutput, false, 200);
+    assert.ok(excerpt.length <= 200);
+    assert.ok(excerpt.includes("ERR_SCHED_FAIL"));
+    assert.ok(
+      excerpt.includes("runtime/scheduler.ts:10"),
+      `compactCommandExcerpt must preserve user app runtime/scheduler.ts:10:\n${excerpt}`,
+    );
+    assert.ok(!excerpt.includes("runtime.gopark"));
+    assert.ok(!excerpt.includes("runtime/proc.go:381"));
+
+    // ReDoS linearity check on the constrained ^runtime branch
+    const t0 = Date.now();
+    stripVendorStackFrames("runtime/" + "a".repeat(20_000));
+    stripVendorStackFrames("runtime." + "a".repeat(20_000));
+    assert.ok(Date.now() - t0 < 10, "Constrained ^runtime branch must stay strictly O(N) < 10ms");
+  });
 });

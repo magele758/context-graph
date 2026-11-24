@@ -18,7 +18,7 @@ const BOILERPLATE_ACK_LINE_RE =
   /^(?:successfully\s+)?(?:edited|updated|wrote|written|created|patched|modified|saved|applied\s+patch(?:\s+to)?|file\s+(?:updated|edited|written|saved))\b[^\n]*$/i;
 
 const VENDOR_STACK_FRAME_RE =
-  /(?:node_modules[\\/]|node:internal[\\/]|internal[\\/]modules[\\/]|\(node:[a-z0-9_/-]+:\d+|\bat\s+node:[a-z0-9_/-]+:\d+|\(internal\/[a-z0-9_/-]+:\d+|(?:^|[\s(/\\])(?:vendor|site-packages|dist-packages)[\\/]|\/go\/src\/(?:runtime|testing)[\\/]|^runtime[./])/i;
+  /(?:node_modules[\\/]|node:internal[\\/]|internal[\\/]modules[\\/]|\(node:[a-z0-9_/-]+:\d+|\bat\s+node:[a-z0-9_/-]+:\d+|\(internal\/[a-z0-9_/-]+:\d+|(?:^|[\s(/\\])(?:vendor|site-packages|dist-packages)[\\/]|\/go\/src\/(?:runtime|testing)[\\/]|^runtime(?:\.[a-z0-9_]+\(|\/[a-z0-9_]+(?:\.[a-z0-9_]+\(|\.(?:go|s):\d+)))/i;
 
 const REDUNDANT_CMD_SUMMARY_RE =
   /^(?:tests?\s+\d+\s+(?:failed|passed)|test\s+files?\s+\d+\s+|command\s+exited\s+with\s+code\s+\d+|exit\s+code[:\s]+\d+|duration\s+\d|start\s+at\s+\d|transform\s+\d|npm\s+(?:err!|error)\b|elifecycle\b|>\s+\S+@\S+\s+|>\s+(?:vitest|jest|mocha|node|tsc|pytest|go\s+test|cargo\s+test)\b)/i;
@@ -166,13 +166,13 @@ const IMPORT_LINE_RE =
   /^(?:import\b|from\s+\S+\s+import\b|export\s+\*\s+from\b|const\s+\S+\s*=\s*require\(|#include\b|using\s+\S+;|use\s+[A-Za-z0-9_:]+;)/;
 
 const TOP_LEVEL_DECL_RE =
-  /^(?:export\s+(?:default\s+)?)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:const|let|var|type|interface|class|function|enum)\b/;
+  /^(?:export\s+(?:default\s+)?)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:const|let|var|type|interface|class|function|enum)(?=\s|\*)/;
 
 const EXPORTED_DECL_RE =
-  /^(?:export\s+(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:const|let|var|type|interface|class|function|enum)\b|pub(?:\([^)\n]*\))?\s+(?:async\s+)?(?:struct|enum|trait|fn|type|const|static)\b)/;
+  /^(?:export\s+(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:const|let|var|type|interface|class|function|enum)(?=\s|\*)|pub(?:\([^)\n]*\))?\s+(?:async\s+)?(?:struct|enum|trait|fn|type|const|static)(?=\s))/;
 
 const MULTILANG_DECL_RE =
-  /^(?:pub(?:\([^)\n]*\))?\s+)?(?:async\s+)?(?:def|class|struct|enum|trait|impl|fn|func|type|const|static|let)\b/;
+  /^(?:pub(?:\([^)\n]*\))?\s+)?(?:async\s+)?(?:def|class|struct|enum|trait|impl|fn|func|type|const|static|let)(?=\s|<)/;
 
 const ENV_OR_INI_KEY_RE =
   /^(?:[A-Z][A-Z0-9_.-]*\s*[:=]|\[[A-Za-z0-9_.-]+\]$)/;
@@ -796,6 +796,15 @@ function isGoFuncCallCandidate(trimmed: string): boolean {
  * offsets and trimming absolute prefixes down to a known relative source root
  * (e.g. `/abs/repo/pkg/demo/srv.go:42 +0x9a` -> `pkg/demo/srv.go:42`).
  */
+function isBarePathFrameLine(line: string): boolean {
+  const noHex = stripTrailingHexOffset(line).trim();
+  if (!noHex || noHex.includes("://") || /\s/.test(noHex) || !noHex.includes("/")) {
+    return false;
+  }
+  const pathOnly = stripLineColSuffix(noHex);
+  return pathOnly.length < noHex.length && FILE_EXT_RE.test(pathOnly);
+}
+
 function normalizeFramePathLine(frameLine: string): string {
   let clean = stripTrailingHexOffset(frameLine).trim().replace(/\\/g, "/");
   if (clean.startsWith("file://")) {
@@ -995,7 +1004,8 @@ export function compactCommandExcerpt(
     const hasCitedPathWithLine =
       !isRedundantSummary && /:\d+/.test(line) && extractAppFileReferences(line).length > 0;
     const isFrame =
-      (APP_STACK_FRAME_RE.test(line) && !isRedundantSummary) || hasCitedPathWithLine;
+      !isRedundantSummary &&
+      (APP_STACK_FRAME_RE.test(line) || hasCitedPathWithLine || isBarePathFrameLine(line));
     const diagProbe = line
       .replace(LEADING_ARROW_RE, "")
       .replace(LEADING_TEST_FILE_PREFIX_RE, "");
