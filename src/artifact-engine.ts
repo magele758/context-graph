@@ -3,6 +3,7 @@ import {
   compactCommandExcerpt,
   extractAppFileReferences,
   sanitizeNeutralText,
+  stripVendorStackFrames,
   truncateAtWordBoundary,
 } from "./excerpt.ts";
 import type { GraphStore } from "./graph-store.ts";
@@ -825,6 +826,21 @@ export function pruneTrajectoryEvents(
         originalChars: eventOrigChars,
       });
     } else {
+      const c = classified[i]!;
+      // Lossless vendor/runtime stack-frame compaction on non-superseded bulky command outputs
+      if (c.family === "command" && typeof ev.output === "string" && ev.output.length > 0) {
+        const stripped = stripVendorStackFrames(ev.output);
+        if (stripped.strippedLines >= 4 && stripped.text.length < ev.output.length) {
+          charsSaved += ev.output.length - stripped.text.length;
+          tokensSaved += Math.max(0, countTokens(ev.output) - countTokens(stripped.text));
+          outEvents.push({
+            ...ev,
+            output: stripped.text,
+            pruned: false,
+          });
+          continue;
+        }
+      }
       outEvents.push({
         ...ev,
         pruned: false,

@@ -18,7 +18,7 @@ const BOILERPLATE_ACK_LINE_RE =
   /^(?:successfully\s+)?(?:edited|updated|wrote|written|created|patched|modified|saved|applied\s+patch(?:\s+to)?|file\s+(?:updated|edited|written|saved))\b[^\n]*$/i;
 
 const VENDOR_STACK_FRAME_RE =
-  /(?:node_modules[\\/]|node:internal[\\/]|internal[\\/]modules[\\/]|\(node:[a-z0-9_/-]+:\d+|\bat\s+node:[a-z0-9_/-]+:\d+|\(internal\/[a-z0-9_/-]+:\d+)/i;
+  /(?:node_modules[\\/]|node:internal[\\/]|internal[\\/]modules[\\/]|\(node:[a-z0-9_/-]+:\d+|\bat\s+node:[a-z0-9_/-]+:\d+|\(internal\/[a-z0-9_/-]+:\d+|(?:^|[\s(/\\])(?:vendor|site-packages|dist-packages)[\\/]|\/go\/src\/(?:runtime|testing)[\\/]|^runtime[./])/i;
 
 const REDUNDANT_CMD_SUMMARY_RE =
   /^(?:tests?\s+\d+\s+(?:failed|passed)|test\s+files?\s+\d+\s+|command\s+exited\s+with\s+code\s+\d+|exit\s+code[:\s]+\d+|duration\s+\d|start\s+at\s+\d|transform\s+\d|npm\s+(?:err!|error)\b|elifecycle\b|>\s+\S+@\S+\s+|>\s+(?:vitest|jest|mocha|node|tsc|pytest|go\s+test|cargo\s+test)\b)/i;
@@ -168,11 +168,16 @@ const IMPORT_LINE_RE =
 const TOP_LEVEL_DECL_RE =
   /^(?:export\s+(?:default\s+)?)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:const|let|var|type|interface|class|function|enum)\b/;
 
+const EXPORTED_DECL_RE =
+  /^(?:export\s+(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:const|let|var|type|interface|class|function|enum)\b|pub(?:\([^)\n]*\))?\s+(?:async\s+)?(?:struct|enum|trait|fn|type|const|static)\b)/;
+
 const MULTILANG_DECL_RE =
   /^(?:pub(?:\([^)\n]*\))?\s+)?(?:async\s+)?(?:def|class|struct|enum|trait|impl|fn|func|type|const|static|let)\b/;
 
 const ENV_OR_INI_KEY_RE =
   /^(?:[A-Z][A-Z0-9_.-]*\s*[:=]|\[[A-Za-z0-9_.-]+\]$)/;
+
+const CODE_TOP_CONST_ASSIGN_RE = /^[A-Z][A-Z0-9_]*\s*=/;
 
 const JSON_OR_YAML_KEY_RE =
   /^(?:"[A-Za-z0-9_.-]+"\s*:|[A-Za-z_][A-Za-z0-9_.-]*\s*:\s*\S)/;
@@ -366,15 +371,51 @@ function detectLineNumberGutter(lines: readonly string[]): boolean {
   return sample >= 2 && matched >= Math.ceil(sample * 0.6);
 }
 
-function classifyCodeLinePriority(rawLine: string, idx: number, hasGutter: boolean): number {
+function countLeadingIndent(line: string): number {
+  let indent = 0;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line.charCodeAt(i);
+    if (ch === 32) indent += 1;
+    else if (ch === 9) indent += 4;
+    else break;
+  }
+  return indent;
+}
+
+function hasUnclosedTrailingBrace(line: string): boolean {
+  if (!line.endsWith("{")) return false;
+  let open = 0;
+  let close = 0;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line.charCodeAt(i);
+    if (ch === 123) open++;
+    else if (ch === 125) close++;
+  }
+  return open > close;
+}
+
+function stripTrailingOpenBrace(line: string): string {
+  if (!hasUnclosedTrailingBrace(line)) return line;
+  const withoutBrace = trimHorizontalEnd(line.slice(0, -1));
+  if (withoutBrace.endsWith("=")) {
+    return trimHorizontalEnd(withoutBrace.slice(0, -1));
+  }
+  return withoutBrace;
+}
+
+function classifyCodeLinePriority(
+  rawLine: string,
+  idx: number,
+  hasGutter: boolean,
+  hasCodeDecls: boolean,
+  hasExportedDecls: boolean,
+): { priority: number; indent: number } {
   const unnumbered = stripOptionalLineNumber(rawLine, hasGutter);
   const trimmed = unnumbered.trim();
+  const indent = countLeadingIndent(unnumbered);
   if (!trimmed || CLOSING_ONLY_RE.test(trimmed)) {
-    return 4;
+    return { priority: 4, indent };
   }
-
-  const indentMatch = unnumbered.match(/^(\s*)/);
-  const indent = indentMatch ? indentMatch[1]!.length : 0;
 
   // Leading module header comment
   if (
@@ -382,31 +423,47 @@ function classifyCodeLinePriority(rawLine: string, idx: number, hasGutter: boole
     trimmed.length <= 120 &&
     /^(?:\/\/|\/\*|\*|--|#(?!include\b)|""")/.test(trimmed)
   ) {
-    return 0;
+    return { priority: 0, indent };
   }
 
   // Imports go below exported declarations & constants so long import blocks never starve symbols
   if (IMPORT_LINE_RE.test(trimmed)) {
-    return 3;
+    return { priority: 3, indent };
   }
 
-  // Top-level declarations, constants, function/class/interface signatures
+  // Top-level declarations, constants, function/class/interface signatures.
+  // When a module explicitly uses `export`/`pub`, reserve P1 for its exported API
+  // surface so unexported trailing private helpers don't crowd the excerpt.
   if (indent <= 2 && (TOP_LEVEL_DECL_RE.test(trimmed) || MULTILANG_DECL_RE.test(trimmed))) {
-    return 1;
+    if (hasExportedDecls && !EXPORTED_DECL_RE.test(trimmed)) {
+      return { priority: 2, indent };
+    }
+    return { priority: 1, indent };
+  }
+
+  // Top-level CONSTANT = value assignments in code files (e.g. Python module constants),
+  // or full ENV / INI key assignments in config files
+  if (hasCodeDecls) {
+    if (!hasExportedDecls && indent <= 2 && CODE_TOP_CONST_ASSIGN_RE.test(trimmed)) {
+      return { priority: 1, indent };
+    }
+    // Indented key: value lines inside code files (TS interfaces, JS objects, Go structs)
+    // stay P2 rather than P1 so fields are never orphaned from their enclosing block.
+    return { priority: 2, indent };
   }
 
   // Config / env / INI assignments
   if (indent <= 2 && ENV_OR_INI_KEY_RE.test(trimmed)) {
-    return 1;
+    return { priority: 1, indent };
   }
 
-  // Shallow JSON / YAML / object config key-value lines
+  // Shallow JSON / YAML config key-value lines (only for non-code config/data files)
   if (indent <= 4 && JSON_OR_YAML_KEY_RE.test(trimmed) && !NON_KV_CONTROL_RE.test(trimmed)) {
-    return 1;
+    return { priority: 1, indent };
   }
 
   // Other meaningful early head/body lines
-  return 2;
+  return { priority: 2, indent };
 }
 
 function stripBoilerplateAcks(text: string): string {
@@ -462,13 +519,38 @@ export function compactCodeExcerpt(
   }
 
   const hasGutter = detectLineNumberGutter(rawLines);
-  const classified = rawLines.map((line, idx) => ({
-    idx,
-    text: hasGutter ? line.replace(/^\s+/, "") : line,
-    priority: classifyCodeLinePriority(line, idx, hasGutter),
-  }));
+  let hasCodeDecls = false;
+  let hasExportedDecls = false;
+  for (const rawLine of rawLines) {
+    const unnumbered = stripOptionalLineNumber(rawLine, hasGutter);
+    const trimmed = unnumbered.trim();
+    if (!trimmed) continue;
+    const indent = countLeadingIndent(unnumbered);
+    if (indent <= 2 && (TOP_LEVEL_DECL_RE.test(trimmed) || MULTILANG_DECL_RE.test(trimmed))) {
+      hasCodeDecls = true;
+      if (EXPORTED_DECL_RE.test(trimmed)) {
+        hasExportedDecls = true;
+      }
+    }
+  }
 
-  // Pack in priority order (P0 header comment max 1 -> P1 declarations -> P2 early lines -> P3 imports)
+  const classified = rawLines.map((line, idx) => {
+    const { priority, indent } = classifyCodeLinePriority(
+      line,
+      idx,
+      hasGutter,
+      hasCodeDecls,
+      hasExportedDecls,
+    );
+    return {
+      idx,
+      text: hasGutter ? line.replace(/^\s+/, "") : line,
+      priority,
+      indent,
+    };
+  });
+
+  // Pack in priority order: P1 declarations FIRST -> P0 leading comment only when sparse/comment-only -> P2 -> P3
   const selected = new Map<number, string>();
   let usedChars = 0;
 
@@ -493,13 +575,7 @@ export function compactCodeExcerpt(
     return false;
   };
 
-  // P0: at most 1 leading module header comment (only if budget leaves ample room for declarations)
-  const p0 = classified.filter((c) => c.priority === 0);
-  if (p0.length > 0 && p0[0]!.text.length <= Math.floor(cap * 0.35)) {
-    tryAdd(p0[0]!.idx, p0[0]!.text, false);
-  }
-
-  // P1: all fitting top-level declarations, constants, signatures, config keys in source order
+  // P1: pack real declarations, constants, signatures, and config keys FIRST
   const p1 = classified.filter((c) => c.priority === 1);
   for (const item of p1) {
     if (!tryAdd(item.idx, item.text, selected.size === 0)) {
@@ -508,10 +584,22 @@ export function compactCodeExcerpt(
       }
     }
   }
+  const p1UsedChars = usedChars;
+
+  // P0: include at most 1 leading module comment ONLY if no P1 declarations exist
+  // or P1 is sparse (< 45% of cap) and the comment fits cleanly within 35% of cap.
+  const p0 = classified.filter((c) => c.priority === 0);
+  if (
+    p0.length > 0 &&
+    (p1.length === 0 ||
+      (p1UsedChars < Math.floor(cap * 0.45) && p0[0]!.text.length <= Math.floor(cap * 0.35)))
+  ) {
+    tryAdd(p0[0]!.idx, p0[0]!.text, p1.length === 0 && selected.size === 0);
+  }
 
   // Once top-level declarations/constants (P1) fill >= 65% of cap, stop packing
   // lower-priority P2 body boilerplate and P3 imports so excerpts stay dense.
-  const p1FilledEnough = p1.length > 0 && usedChars >= Math.floor(cap * 0.65);
+  const p1FilledEnough = p1.length > 0 && p1UsedChars >= Math.floor(cap * 0.65);
 
   if (!p1FilledEnough) {
     // P2: meaningful head/body lines in source order
@@ -535,10 +623,22 @@ export function compactCodeExcerpt(
     return truncateAtWordBoundary(classified[0]!.text, cap);
   }
 
-  // Emit in original source line order
-  const ordered = Array.from(selected.entries())
-    .sort((a, b) => a[0] - b[0])
-    .map(([, text]) => text);
+  // Emit in original source line order, cleaning dangling unclosed `{` on P1 code block
+  // headers whose indented body lines were not included.
+  const orderedEntries = Array.from(selected.entries()).sort((a, b) => a[0] - b[0]);
+  const ordered = orderedEntries.map(([origIdx, text], pos) => {
+    if (!hasCodeDecls) return text;
+    const meta = classified[origIdx]!;
+    if (meta.priority !== 1 || !hasUnclosedTrailingBrace(text)) {
+      return text;
+    }
+    const nextEntry = orderedEntries[pos + 1];
+    const hasImmediateBody =
+      nextEntry !== undefined &&
+      nextEntry[0] === origIdx + 1 &&
+      classified[nextEntry[0]!]!.indent > meta.indent;
+    return hasImmediateBody ? text : stripTrailingOpenBrace(text);
+  });
 
   const joined = ordered.join("\n");
   return joined.length <= cap ? joined : truncateAtWordBoundary(joined, cap);
@@ -630,6 +730,172 @@ function stripTrailingHexOffset(line: string): string {
   return idx + 3 < line.length ? trimHorizontalEnd(line.slice(0, idx)) : line;
 }
 
+/**
+ * Strictly O(N) extractor for Go-style stack-trace function lines
+ * (e.g. `example.com/mod/pkg/queue.(*WorkerPool).AwaitAck(0xc000...)` ->
+ * `queue.(*WorkerPool).AwaitAck`). Returns null for non-call lines.
+ */
+function extractShortGoFuncName(line: string): string | null {
+  const trimmed = line.trim();
+  if (trimmed.length < 4 || !trimmed.endsWith(")")) return null;
+
+  // Match the trailing `(...)` argument list with a single backward paren-depth scan
+  let depth = 0;
+  let argOpenIdx = -1;
+  for (let i = trimmed.length - 1; i >= 0; i--) {
+    const ch = trimmed.charCodeAt(i);
+    if (ch === 41) {
+      depth++;
+    } else if (ch === 40) {
+      depth--;
+      if (depth === 0) {
+        argOpenIdx = i;
+        break;
+      }
+    }
+  }
+  if (argOpenIdx <= 0 || depth !== 0) return null;
+
+  const symbol = trimmed.slice(0, argOpenIdx).trim();
+  if (
+    !symbol ||
+    !symbol.includes(".") ||
+    symbol.includes(":") ||
+    /\s/.test(symbol)
+  ) {
+    return null;
+  }
+
+  const lastSlash = symbol.lastIndexOf("/");
+  const shortName = lastSlash >= 0 ? symbol.slice(lastSlash + 1) : symbol;
+  if (
+    shortName.length < 2 ||
+    shortName.length > 80 ||
+    !/^[A-Za-z0-9_.*()[\]]+$/.test(shortName)
+  ) {
+    return null;
+  }
+  return shortName;
+}
+
+function isGoFuncCallCandidate(trimmed: string): boolean {
+  if (
+    !trimmed ||
+    FAIL_HEADER_RE.test(trimmed) ||
+    ERROR_DIAG_RE.test(trimmed) ||
+    APP_STACK_FRAME_RE.test(trimmed) ||
+    /\.\w+:\d+/.test(trimmed)
+  ) {
+    return false;
+  }
+  return extractShortGoFuncName(trimmed) !== null;
+}
+
+/**
+ * Normalizes a bare `<path>:<line>` stack frame by removing trailing hex PC
+ * offsets and trimming absolute prefixes down to a known relative source root
+ * (e.g. `/abs/repo/pkg/demo/srv.go:42 +0x9a` -> `pkg/demo/srv.go:42`).
+ */
+function normalizeFramePathLine(frameLine: string): string {
+  let clean = stripTrailingHexOffset(frameLine).trim().replace(/\\/g, "/");
+  if (clean.startsWith("file://")) {
+    clean = clean.slice("file://".length);
+  }
+  if (clean.startsWith("/") || /^[A-Za-z]:\//.test(clean)) {
+    let bestStart = -1;
+    for (const prefix of SOURCE_ROOT_PREFIXES) {
+      const idx = clean.indexOf(`/${prefix}`);
+      if (idx >= 0) {
+        const start = idx + 1;
+        if (bestStart === -1 || start < bestStart) {
+          bestStart = start;
+        }
+      }
+    }
+    if (bestStart >= 0) {
+      clean = clean.slice(bestStart);
+    }
+  }
+  return clean;
+}
+
+function computeVendorDropMask(rawLines: readonly string[]): {
+  drop: Uint8Array;
+  strippedLines: number;
+} {
+  const n = rawLines.length;
+  const drop = new Uint8Array(n);
+  let strippedLines = 0;
+
+  for (let i = 0; i < n; i++) {
+    const trimmed = rawLines[i]!.trim();
+    if (trimmed.length > 0 && VENDOR_STACK_FRAME_RE.test(trimmed)) {
+      drop[i] = 1;
+      strippedLines++;
+    }
+  }
+
+  // Pair Go vendor/runtime function lines (line i) with their vendor file lines (line i+1)
+  for (let i = 0; i + 1 < n; i++) {
+    if (drop[i] === 0 && drop[i + 1] === 1) {
+      const trimmed = rawLines[i]!.trim();
+      if (isGoFuncCallCandidate(trimmed)) {
+        drop[i] = 1;
+        strippedLines++;
+      }
+    }
+  }
+
+  return { drop, strippedLines };
+}
+
+/**
+ * Losslessly strips vendor/runtime stack-frame lines (`node_modules/`,
+ * `node:internal/`, `vendor/`, `site-packages/`, `dist-packages/`, Go runtime
+ * & testing stdlib pairs) from command outputs in strictly linear O(N) time.
+ *
+ * Preserves all application frames, test lines, error messages, assertions,
+ * and headers untouched without inserting `[pruned` or truncation markers.
+ */
+export function stripVendorStackFrames(output: string): {
+  text: string;
+  strippedLines: number;
+} {
+  if (!output) return { text: output, strippedLines: 0 };
+  const rawLines = output.split("\n");
+  const { drop, strippedLines } = computeVendorDropMask(rawLines);
+  if (strippedLines === 0) {
+    return { text: output, strippedLines: 0 };
+  }
+
+  const kept: string[] = [];
+  let prevWasDropped = false;
+  let prevKeptWasBlank = false;
+
+  for (let i = 0; i < rawLines.length; i++) {
+    if (drop[i] === 1) {
+      prevWasDropped = true;
+      continue;
+    }
+    const line = rawLines[i]!;
+    const isBlank = line.trim().length === 0;
+    if (isBlank && prevWasDropped && prevKeptWasBlank) {
+      continue;
+    }
+    kept.push(line);
+    prevKeptWasBlank = isBlank;
+    prevWasDropped = false;
+  }
+
+  if (prevWasDropped) {
+    while (kept.length > 0 && kept[kept.length - 1]!.trim().length === 0) {
+      kept.pop();
+    }
+  }
+
+  return { text: kept.join("\n"), strippedLines };
+}
+
 function packLinesSequentially(lines: readonly string[], maxChars: number): string {
   const nonEmpty = lines.map((l) => trimHorizontalEnd(l)).filter((l) => l.trim().length > 0);
   if (nonEmpty.length === 0) return "";
@@ -702,17 +968,22 @@ export function compactCommandExcerpt(
     return truncateAtWordBoundary(chosen, passCap);
   }
 
-  // Failure path: drop noisy vendor/runtime stack frames first
-  const nonVendorLines = allLines.filter((l) => !VENDOR_STACK_FRAME_RE.test(l));
+  // Failure path: drop noisy vendor/runtime stack frames (including Go func+file pairs) first
+  const { drop: vendorDrop } = computeVendorDropMask(allLines);
+  const nonVendorLines: string[] = [];
+  for (let i = 0; i < allLines.length; i++) {
+    if (vendorDrop[i] === 0) nonVendorLines.push(allLines[i]!);
+  }
   const workingLines = nonVendorLines.length > 0 ? nonVendorLines : allLines;
 
   const headers: string[] = [];
   const runnerBanners: string[] = [];
   const diagnostics: string[] = [];
-  const appFrames: string[] = [];
+  const appFrames: Array<{ text: string; idx: number }> = [];
   const fallback: string[] = [];
 
-  for (const line of workingLines) {
+  for (let lineIdx = 0; lineIdx < workingLines.length; lineIdx++) {
+    const line = workingLines[lineIdx]!;
     const isRedundantSummary = REDUNDANT_CMD_SUMMARY_RE.test(line);
     if (!isRedundantSummary && RUNNER_FILE_BANNER_RE.test(line)) {
       runnerBanners.push(line);
@@ -732,19 +1003,19 @@ export function compactCommandExcerpt(
       !isRedundantSummary && (ERROR_DIAG_RE.test(line) || ERROR_DIAG_RE.test(diagProbe));
 
     if (isExplicitStackLine && isFrame) {
-      appFrames.push(line);
+      appFrames.push({ text: line, idx: lineIdx });
     } else if (isHeader) {
       // Check test/suite headers BEFORE diagnostics so test filenames like
       // `FAIL src/error-handler.test.ts` never displace real Error diagnostics.
       const cleanHeader = line.replace(GO_FAIL_TIMING_RE, "$1");
       headers.push(cleanHeader);
       if (isFrame && /\.\w+:\d+/.test(line)) {
-        appFrames.push(line);
+        appFrames.push({ text: line, idx: lineIdx });
       }
     } else if (isDiag) {
       diagnostics.push(line.replace(LEADING_ARROW_RE, ""));
     } else if (isFrame) {
-      appFrames.push(line);
+      appFrames.push({ text: line, idx: lineIdx });
     } else if (!isRedundantSummary) {
       fallback.push(line);
     }
@@ -752,10 +1023,29 @@ export function compactCommandExcerpt(
 
   // Strictly prefer a non-test application source frame (e.g. worker.go:118, jwt.ts:142)
   // over test harness frames (*_test.go, *.test.ts, *.spec.ts, test_*.py)
-  const nonTestFrameRaw = appFrames.find((f) => !TEST_FILE_FRAME_RE.test(f));
-  const rawPrimaryFrame = nonTestFrameRaw ?? appFrames[0];
-  const primaryFrame = rawPrimaryFrame ? stripTrailingHexOffset(rawPrimaryFrame) : undefined;
-  const hasNonTestFrame = Boolean(nonTestFrameRaw);
+  const nonTestFrameEntry = appFrames.find((f) => !TEST_FILE_FRAME_RE.test(f.text));
+  const primaryFrameEntry = nonTestFrameEntry ?? appFrames[0];
+  let primaryFrame: string | undefined;
+  if (primaryFrameEntry) {
+    const rawText = primaryFrameEntry.text;
+    const isBarePathFrame = !/^\s*(?:at\s+\S|File\s+"[^"\n]+",\s+line\s+\d+)/.test(rawText);
+    if (isBarePathFrame) {
+      const cleanPathLine = normalizeFramePathLine(rawText);
+      const prevLine = primaryFrameEntry.idx > 0 ? workingLines[primaryFrameEntry.idx - 1] : undefined;
+      const shortFunc =
+        prevLine &&
+        !VENDOR_STACK_FRAME_RE.test(prevLine) &&
+        !FAIL_HEADER_RE.test(prevLine) &&
+        !ERROR_DIAG_RE.test(prevLine) &&
+        !/\.\w+:\d+/.test(prevLine)
+          ? extractShortGoFuncName(prevLine)
+          : null;
+      primaryFrame = shortFunc ? `at ${shortFunc} (${cleanPathLine})` : cleanPathLine;
+    } else {
+      primaryFrame = stripTrailingHexOffset(rawText);
+    }
+  }
+  const hasNonTestFrame = Boolean(nonTestFrameEntry);
 
   const primaryHeader = headers[0];
   let primaryDiag = diagnostics[0];

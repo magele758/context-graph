@@ -18,6 +18,7 @@ import {
   compactCommandExcerpt,
   extractAppFileReferences,
   sanitizeNeutralText,
+  stripVendorStackFrames,
   truncateAtWordBoundary,
 } from "./excerpt.ts";
 import { GraphStore } from "./graph-store.ts";
@@ -2849,5 +2850,284 @@ describe("v0.2.2 Excerpt Ordering & Diff Preservation Suite (V2.2-1 & V2.2-2)", 
     }
     const elapsedMs = Date.now() - t0;
     assert.ok(elapsedMs < 10, `Expected linear O(N) runtime < 10ms, got ${elapsedMs}ms`);
+  });
+});
+
+describe("v0.2.3 Code Excerpt, Go Frame Pairing & Lossless Vendor Stripping Suite", () => {
+  it("51. excludes indented interface/object/struct fields from P1, strips dangling `{`, and keeps YAML/JSON keys as P1", () => {
+    // TypeScript source with interface + object literal + balanced single-line function
+    const tsCode = [
+      "export const SERVICE_NAME = 'demo-gateway';",
+      "export interface ThrottleDecision {",
+      "  allowed: boolean;",
+      "  accepted: number;",
+      "  remaining: number;",
+      "}",
+      "export const DEFAULT_OPTS = {",
+      "  enabled: true,",
+      "  retries: 4,",
+      "};",
+      "export function evaluateLimit(count: number, max: number): ThrottleDecision {",
+      "  return { allowed: count < max, accepted: count, remaining: max - count };",
+      "}",
+      "export function isReady(): boolean { return true; }",
+    ].join("\n");
+
+    const tsEx = compactCodeExcerpt(tsCode, 260);
+    assert.ok(tsEx.length <= 260, `Expected <= 260, got ${tsEx.length}`);
+    assert.ok(tsEx.includes("export const SERVICE_NAME = 'demo-gateway';"));
+    assert.ok(tsEx.includes("export interface ThrottleDecision"), `Missing interface decl:\n${tsEx}`);
+    assert.ok(
+      !tsEx.includes("export interface ThrottleDecision {"),
+      `Dangling unclosed '{' must be stripped when body lines are omitted:\n${tsEx}`,
+    );
+    assert.ok(
+      !tsEx.includes("export const DEFAULT_OPTS ="),
+      `Dangling '=' after stripped '{' must also be cleaned:\n${tsEx}`,
+    );
+    assert.ok(
+      !tsEx.includes("allowed: boolean;"),
+      `Indented interface fields must NOT be promoted to P1:\n${tsEx}`,
+    );
+    assert.ok(
+      !tsEx.includes("enabled: true,"),
+      `Indented object-literal properties must NOT be promoted to P1:\n${tsEx}`,
+    );
+    assert.ok(
+      tsEx.includes("export function isReady(): boolean { return true; }"),
+      `Balanced single-line '{ ... }' must stay untouched:\n${tsEx}`,
+    );
+
+    // Go source with tab-indented struct fields
+    const goCode = [
+      "package demo",
+      "const MaxAttempts = 5",
+      "type RunnerConfig struct {",
+      "\tMaxAttempts int",
+      "\tEndpoint    string",
+      "\tTimeoutSec  int",
+      "}",
+      "var DefaultConfig = RunnerConfig{",
+      "\tMaxAttempts: MaxAttempts,",
+      "\tEndpoint:    \"http://localhost:8080\",",
+      "}",
+      "func StartRunner(cfg RunnerConfig) error {",
+      "\treturn nil",
+      "}",
+    ].join("\n");
+
+    const goEx = compactCodeExcerpt(goCode, 140);
+    assert.ok(goEx.length <= 140);
+    assert.ok(goEx.includes("const MaxAttempts = 5"));
+    assert.ok(goEx.includes("type RunnerConfig struct"));
+    assert.ok(
+      !goEx.includes("type RunnerConfig struct {"),
+      `Unclosed Go struct '{' must be stripped:\n${goEx}`,
+    );
+    assert.ok(
+      !goEx.includes("MaxAttempts: MaxAttempts,"),
+      `Tab-indented Go struct-literal field must not be P1:\n${goEx}`,
+    );
+    assert.ok(goEx.includes("func StartRunner(cfg RunnerConfig) error"));
+
+    // YAML config file (no code declarations): shallow key: value lines MUST remain P1!
+    const yamlCfg = [
+      "# config/app.yaml",
+      "service:",
+      "  host: 127.0.0.1",
+      "  port: 8443",
+      "  timeout_ms: 2500",
+      "logging:",
+      "  level: info",
+      "  format: json",
+      "notes: |",
+      "  " + "extra trailing prose line ".repeat(12),
+    ].join("\n");
+    const yamlEx = compactCodeExcerpt(yamlCfg, 140);
+    assert.ok(yamlEx.length <= 140);
+    assert.ok(yamlEx.includes("host: 127.0.0.1"), `YAML keys must remain P1:\n${yamlEx}`);
+    assert.ok(yamlEx.includes("port: 8443"));
+    assert.ok(yamlEx.includes("timeout_ms: 2500"));
+  });
+
+  it("52. packs P1 declarations ahead of P0 decorative leading comments while keeping P0 on comment-only/sparse files", () => {
+    const richCode = [
+      "// src/demo/calc.ts — decorative header comment repeating the file path and overview",
+      "export const BASE_PRECISION = 6;",
+      "export const ROUNDING_MODE = 'half_even';",
+      "export const MAX_OPERAND = 1000000;",
+      "export function computeTotal(subtotal: number, factor: number): number {",
+      "  return Math.round(subtotal * factor);",
+      "}",
+    ].join("\n");
+
+    // Tight 200-char budget: P1 declarations fill >= 45%, so decorative P0 comment is skipped
+    // and real function signature fits cleanly!
+    const tightEx = compactCodeExcerpt(richCode, 200);
+    assert.ok(tightEx.length <= 200);
+    assert.ok(tightEx.includes("export const BASE_PRECISION = 6;"));
+    assert.ok(tightEx.includes("export function computeTotal(subtotal: number, factor: number): number"));
+    assert.ok(
+      !tightEx.includes("decorative header comment"),
+      `Decorative P0 comment must not steal budget from P1 declarations:\n${tightEx}`,
+    );
+
+    // Comment-only / sparse file still preserves P0 leading comment
+    const commentOnly = [
+      "// Deployment runbook overview for staging cluster",
+      "// Step 1: verify health check",
+      "Run smoke checks before promoting build artifacts to production nodes. ".repeat(6),
+    ].join("\n");
+    const commentEx = compactCodeExcerpt(commentOnly, 140);
+    assert.ok(commentEx.includes("// Deployment runbook overview"));
+
+    const sparseCode = [
+      "// Short note",
+      "export const FLAG = 1;",
+      ...Array.from({ length: 12 }, (_, i) => `  const filler_${i} = ${i};`),
+    ].join("\n");
+    const sparseEx = compactCodeExcerpt(sparseCode, 200);
+    assert.ok(sparseEx.includes("// Short note"), `Sparse file (<45% P1) should retain P0:\n${sparseEx}`);
+    assert.ok(sparseEx.includes("export const FLAG = 1;"));
+  });
+
+  it("53. pairs 2-line Go stack frames into `at <shortFunc> (<relPath:line>)` and ignores vendor/stdlib without false positives on vendor_id", () => {
+    const goStack = [
+      "--- FAIL: TestRunnerExecute (0.14s)",
+      "    runner_test.go:28: Error [ERR_EXEC_TIMEOUT]: deadline exceeded",
+      "    testing.tRunner(0xc000102d00, 0x104c8a0)",
+      "    \t/usr/local/go/src/testing/testing.go:1595 +0xff",
+      "    runtime.goexit()",
+      "    \t/usr/local/go/src/runtime/asm_amd64.s:1650 +0x1",
+      "    example.com/mod/pkg/demo.(*Srv).Run(0xc00012a000, {0x1, 0x2})",
+      "    \t/workspace/repo/pkg/demo/runner.go:42 +0x9a",
+    ].join("\n");
+
+    const goEx = compactCommandExcerpt(goStack, false, 240);
+    assert.ok(goEx.length <= 240, `Expected <= 240, got ${goEx.length}`);
+    assert.ok(goEx.includes("--- FAIL: TestRunnerExecute"));
+    assert.ok(goEx.includes("Error [ERR_EXEC_TIMEOUT]: deadline exceeded"));
+    assert.ok(
+      goEx.includes("at demo.(*Srv).Run (pkg/demo/runner.go:42)"),
+      `Expected paired Go func + relative path, got:\n${goEx}`,
+    );
+    assert.ok(!goEx.includes("testing.tRunner"), "Go stdlib testing pair must be stripped");
+    assert.ok(!goEx.includes("runtime.goexit"), "Go runtime pair must be stripped");
+    assert.ok(!goEx.includes("/workspace/repo/"), "Absolute prefix should normalize to pkg/demo/runner.go:42");
+
+    // App file containing `vendor_id` must NEVER be treated as a vendor frame!
+    const vendorIdFail = [
+      "FAIL src/orders/vendor_id.test.ts",
+      "  Error [ERR_BAD_ID]: invalid vendor_id format",
+      "    at parseVendorId (src/orders/vendor_id.ts:19:7)",
+    ].join("\n");
+    const vidEx = compactCommandExcerpt(vendorIdFail, false, 200);
+    assert.ok(
+      vidEx.includes("src/orders/vendor_id.ts:19:7"),
+      `App file with 'vendor_id' must not be falsely filtered as vendor/:\n${vidEx}`,
+    );
+  });
+
+  it("54. losslessly strips >=4 vendor/runtime frames from non-superseded command outputs in pruneTrajectoryEvents", () => {
+    const noisyNodeFail = [
+      "FAIL src/demo/calc.test.ts > computes checksum",
+      "  Error [ERR_CHECKSUM]: expected 42 got 41",
+      "    at computeChecksum (src/demo/calc.ts:31:9)",
+      "    at runTask (node_modules/vitest/dist/runner.js:410:12)",
+      "    at runSuite (node_modules/vitest/dist/suite.js:180:9)",
+      "    at runFiles (node_modules/tinypool/dist/worker.js:95:14)",
+      "    at processTicksAndRejections (node:internal/process/task_queues:95:5)",
+      "    at async node:internal/modules/esm/loader:220:11",
+    ].join("\n");
+
+    const noisyGoFail = [
+      "--- FAIL: TestSrv (0.10s)",
+      "    Error [ERR_PANIC]: nil pointer",
+      "    example.com/mod/pkg/demo.(*Srv).Run(0xc0001)",
+      "    \t/workspace/pkg/demo/srv.go:42 +0x9a",
+      "    github.com/dep/vendor/pkg/net.(*Client).Do(0xc0002)",
+      "    \t/workspace/vendor/github.com/dep/pkg/net/client.go:90 +0x12",
+      "    testing.tRunner(0xc0003, 0x104c)",
+      "    \t/usr/local/go/src/testing/testing.go:1595 +0xff",
+    ].join("\n");
+
+    const smallVendorFail = [
+      "FAIL src/demo/small.test.ts",
+      "  Error [ERR_TINY]: mismatch",
+      "    at check (src/demo/small.ts:8:5)",
+      "    at runTask (node_modules/vitest/dist/runner.js:10:2)",
+      "    at processTicks (node:internal/process/task_queues:95:5)",
+    ].join("\n");
+
+    const events: ToolTrajectoryEvent[] = [
+      { callId: "cmd_node", tool: "bash", args: { command: "npm test" }, ok: false, output: noisyNodeFail },
+      { callId: "cmd_go", tool: "bash", args: { command: "go test ./..." }, ok: false, output: noisyGoFail },
+      { callId: "cmd_small", tool: "bash", args: { command: "npm run test:unit" }, ok: false, output: smallVendorFail },
+    ];
+
+    const origSnapshot = JSON.stringify(events);
+    const res = pruneTrajectoryEvents(events);
+    assert.equal(JSON.stringify(events), origSnapshot, "Input events must remain unmutated");
+    assert.equal(res.prunedCount, 0, "Non-superseded commands must keep prunedCount = 0");
+    assert.ok(res.charsSaved > 200, `Expected substantial charsSaved from vendor stripping, got ${res.charsSaved}`);
+    assert.ok(res.tokensSaved > 40, `Expected substantial tokensSaved, got ${res.tokensSaved}`);
+
+    const outNode = res.events.find((e) => e.callId === "cmd_node")!;
+    assert.equal(outNode.pruned, false);
+    assert.ok(outNode.output.includes("Error [ERR_CHECKSUM]: expected 42 got 41"));
+    assert.ok(outNode.output.includes("at computeChecksum (src/demo/calc.ts:31:9)"));
+    assert.ok(!outNode.output.includes("node_modules/"));
+    assert.ok(!outNode.output.includes("node:internal/"));
+    assert.ok(!outNode.output.includes("[pruned") && !outNode.output.includes("[truncated") && !outNode.output.includes("head/tail shown"));
+
+    const outGo = res.events.find((e) => e.callId === "cmd_go")!;
+    assert.equal(outGo.pruned, false);
+    assert.ok(outGo.output.includes("pkg/demo/srv.go:42"));
+    assert.ok(outGo.output.includes("example.com/mod/pkg/demo.(*Srv).Run"));
+    assert.ok(!outGo.output.includes("vendor/github.com/"));
+    assert.ok(!outGo.output.includes("testing.tRunner"));
+    assert.ok(!outGo.output.includes("/go/src/testing/"));
+
+    // < 4 vendor lines -> left untouched byte-for-byte!
+    const outSmall = res.events.find((e) => e.callId === "cmd_small")!;
+    assert.equal(outSmall.output, smallVendorFail, "Outputs with < 4 vendor lines must be untouched byte-for-byte");
+  });
+
+  it("55. maintains strictly linear O(N) runtime (< 20ms) across stripVendorStackFrames, excerpts, and pruneTrajectoryEvents on 20KB+ adversarial inputs", () => {
+    const spaces20k = " ".repeat(20_000) + "x";
+    const brackets20k = "[".repeat(20_000) + "{".repeat(5_000);
+    const parens20k = "(".repeat(20_000) + ")".repeat(20_000);
+    const vendor5000 = [
+      "Error [ERR_STRESS]: root cause",
+      "  at run (src/demo/app.ts:12:3)",
+      ...Array.from(
+        { length: 5_000 },
+        (_, i) => `  at frame${i} (node_modules/pkg/index.js:${i}:1)`,
+      ),
+    ].join("\n");
+
+    // Warm JIT once
+    stripVendorStackFrames("x");
+
+    const t0 = Date.now();
+    stripVendorStackFrames(spaces20k);
+    stripVendorStackFrames(brackets20k);
+    stripVendorStackFrames(parens20k);
+    const stripped = stripVendorStackFrames(vendor5000);
+    compactCodeExcerpt(spaces20k, 240);
+    compactCodeExcerpt(brackets20k, 240);
+    compactCommandExcerpt(parens20k, false, 240);
+    compactCommandExcerpt(vendor5000, false, 240);
+    pruneTrajectoryEvents([
+      { callId: "s1", tool: "bash", args: { command: "npm test" }, ok: false, output: vendor5000 },
+    ]);
+    const elapsedMs = Date.now() - t0;
+
+    assert.equal(stripped.strippedLines, 5_000);
+    assert.ok(stripped.text.includes("at run (src/demo/app.ts:12:3)"));
+    assert.ok(
+      elapsedMs < 20,
+      `Expected strictly linear O(N) runtime < 20ms on 20KB+ / 5000-line inputs, got ${elapsedMs}ms`,
+    );
   });
 });
