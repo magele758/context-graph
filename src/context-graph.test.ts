@@ -12,10 +12,11 @@ import {
 } from "./artifact-engine.ts";
 import { runBenchmark } from "./benchmark.ts";
 import { runCli } from "./cli.ts";
-import { compileContext } from "./compiler.ts";
+import { compileContext, DEFAULT_COMPACT_MAX_CHARS } from "./compiler.ts";
 import {
   compactCodeExcerpt,
   compactCommandExcerpt,
+  extractAppFileReferences,
   sanitizeNeutralText,
   truncateAtWordBoundary,
 } from "./excerpt.ts";
@@ -2420,5 +2421,301 @@ describe("v0.2 Review Hardening Regression Suite (B1-B4 & NB1-NB3)", () => {
       tight.includes("src/client.ts:88:11"),
       `App stack frame must be preserved:\n${tight}`,
     );
+  });
+});
+
+describe("v0.2.1 Refinement Suite (V2.1-1, V2.1-2, V2.1-3)", () => {
+  it("43. [V2.1-1] prunes large args payload fields on superseded full_write events without mutating inputs", () => {
+    const staleBody = Array.from(
+      { length: 80 },
+      (_, i) => `export const STALE_CONST_${i} = ${i * 100};`,
+    ).join("\n");
+    const freshBody = "export const FRESH_CONST = 999;";
+
+    const events: ToolTrajectoryEvent[] = [
+      {
+        callId: "w1",
+        tool: "write_file",
+        args: { path: "src/module.ts", content: staleBody, encoding: "utf8" },
+        ok: true,
+        output: "Wrote src/module.ts",
+      },
+      {
+        callId: "w2",
+        tool: "create_file",
+        args: { path: "src/alt.ts", file_content: staleBody },
+        ok: true,
+        output: "Created src/alt.ts",
+      },
+      {
+        callId: "w1_new",
+        tool: "write_file",
+        args: { path: "src/module.ts", content: freshBody, encoding: "utf8" },
+        ok: true,
+        output: "Wrote src/module.ts",
+      },
+      {
+        callId: "r2_new",
+        tool: "read_file",
+        args: { path: "src/alt.ts" },
+        ok: true,
+        output: "export const ALT_FINAL = 1;",
+      },
+    ];
+
+    const origSnapshot = JSON.stringify(events);
+    const res = pruneTrajectoryEvents(events);
+    assert.equal(JSON.stringify(events), origSnapshot, "Caller events and args must never be mutated");
+    assert.equal(res.prunedCount, 2);
+
+    const prunedW1 = res.events.find((e) => e.callId === "w1")!;
+    assert.equal(prunedW1.pruned, true);
+    assert.equal(prunedW1.args?.path, "src/module.ts", "path metadata must remain untouched");
+    assert.equal(prunedW1.args?.encoding, "utf8", "other args metadata must remain untouched");
+    assert.equal(
+      prunedW1.args?.content,
+      "[superseded: newer full_write on file:src/module.ts]",
+    );
+
+    const prunedW2 = res.events.find((e) => e.callId === "w2")!;
+    assert.equal(prunedW2.args?.path, "src/alt.ts");
+    assert.equal(
+      prunedW2.args?.file_content,
+      "[superseded: newer full_read on file:src/alt.ts]",
+    );
+
+    // Active w1_new must remain completely unpruned
+    const keptW1New = res.events.find((e) => e.callId === "w1_new")!;
+    assert.equal(keptW1New.pruned, false);
+    assert.equal(keptW1New.args?.content, freshBody);
+
+    // Savings must credit both pruned 4KB+ payloads (not just the tiny 19-byte output ack!)
+    assert.ok(
+      res.charsSaved > staleBody.length * 2 - 200,
+      `Expected charsSaved > ${staleBody.length * 2 - 200}, got ${res.charsSaved}`,
+    );
+    assert.ok(res.tokensSaved > 400, `Expected substantial tokensSaved, got ${res.tokensSaved}`);
+  });
+
+  it("44. [V2.1-2] extracts app file refs linearly, links depends_on from failures, and promotes cited read-only files to Tier 2", () => {
+    const stackOutput = [
+      "FAIL packages/core/src/session.test.ts > verifies key rotation",
+      "  Error [ERR_KEY_EXPIRED]: active key rotation failed",
+      "    at runTest (node_modules/vitest/dist/runner.js:440:12)",
+      "    at processTicks (node:internal/process/task_queues:95:5)",
+      "    at verifyKey (/workspace/repo/src/security/keyring.ts:142:9)",
+      "    at packages/core/src/session.test.ts:50:11",
+    ].join("\n");
+
+    const refs = extractAppFileReferences(stackOutput);
+    assert.ok(refs.includes("src/security/keyring.ts"), `Missing implementation ref: ${refs}`);
+    assert.ok(refs.includes("packages/core/src/session.test.ts"), `Missing monorepo path ref: ${refs}`);
+    assert.equal(refs[0], "src/security/keyring.ts", "Non-test implementation file should come first");
+    assert.ok(!refs.some((r) => r.includes("node_modules")), "Must exclude node_modules");
+    assert.ok(!refs.some((r) => r.includes("task_queues")), "Must exclude node:internal");
+
+    // ReDoS linearity check on extractAppFileReferences
+    const t0 = Date.now();
+    extractAppFileReferences(" ".repeat(20_000) + "x");
+    extractAppFileReferences("src/".repeat(5_000));
+    extractAppFileReferences("(".repeat(20_000));
+    assert.ok(Date.now() - t0 < 50, "extractAppFileReferences must execute in linear O(N) time");
+
+    // Graph promotion test: read-only file cited by failing stack trace is promoted to Tier 2
+    // while unrelated read-only files stay collapsed in [other read files]
+    const store = new GraphStore(":memory:");
+    const g = store.createGraph({ id: "g_cited_promo", name: "Failure-Cited Promotion" });
+
+    ingestToolArtifacts(store, g.id, [
+      {
+        callId: "r_key",
+        tool: "read_file",
+        args: { path: "src/security/keyring.ts" },
+        ok: true,
+        output: "export const KEY_TTL_SECONDS = 3600;\nexport const ROTATION_GRACE_SEC = 120;\nexport function verifyKey(id: string) { return id.length > 0; }",
+      },
+      {
+        callId: "r_noise1",
+        tool: "read_file",
+        args: { path: "src/ui/theme.ts" },
+        ok: true,
+        output: "export const THEME_ACCENT = '#123456';\n".repeat(8),
+      },
+      {
+        callId: "r_noise2",
+        tool: "read_file",
+        args: { path: "src/docs/changelog.ts" },
+        ok: true,
+        output: "export const CHANGELOG_HEADING = 'v1';\n".repeat(8),
+      },
+      {
+        callId: "cmd_fail",
+        tool: "bash",
+        args: { command: "npm test" },
+        ok: false,
+        output: stackOutput,
+      },
+    ]);
+
+    // Verify genuine depends_on edge from failing command to read-only src/security/keyring.ts
+    const nodes = store.listNodes(g.id, { status: "active" });
+    const failNode = nodes.find((n) => n.resourceKey === "cmd:npm test")!;
+    const keyNode = nodes.find((n) => n.resourceKey === "file:src/security/keyring.ts")!;
+    const depEdges = store.listEdges(g.id, { kind: "depends_on" });
+    assert.ok(
+      depEdges.some((e) => e.sourceId === failNode.id && e.targetId === keyNode.id),
+      "Failing command must add depends_on edge to active file cited in stack trace",
+    );
+
+    const compiled = compileContext(store, {
+      graphId: g.id,
+      format: "compact_markdown",
+    });
+    assert.ok(compiled.promptText.length <= DEFAULT_COMPACT_MAX_CHARS);
+    assert.ok(
+      compiled.promptText.includes("KEY_TTL_SECONDS = 3600"),
+      `Failure-cited read-only file must be promoted to Tier 2:\n${compiled.promptText}`,
+    );
+    assert.ok(compiled.promptText.includes("ROTATION_GRACE_SEC = 120"));
+    assert.ok(compiled.promptText.includes("- [other read files]:"));
+    assert.ok(!compiled.promptText.includes("THEME_ACCENT"), "Unrelated read-only files must stay collapsed");
+    store.close();
+  });
+
+  it("45. [V2.1-2] strictly prefers non-test implementation frames over test harness frames in compactCommandExcerpt", () => {
+    // Go failure: *_test.go appears before implementation .go file
+    const goFail = [
+      "--- FAIL: TestQueueDrain (0.02s)",
+      "    Error: ERR_QUEUE_STALLED: worker stopped before drain completed",
+      "    pkg/queue/worker_test.go:84 +0x1c",
+      "    pkg/queue/worker.go:118 +0x2a",
+    ].join("\n");
+    const goEx = compactCommandExcerpt(goFail, false, 180);
+    assert.ok(goEx.length <= 180);
+    assert.ok(goEx.includes("pkg/queue/worker.go:118"), `Expected non-test Go frame, got:\n${goEx}`);
+
+    // TypeScript failure: *.test.ts appears before implementation .ts file
+    const tsFail = [
+      "FAIL src/auth/jwt.test.ts > rejects invalid audience",
+      "  Error [ERR_AUD_MISMATCH]: audience check failed",
+      "    at src/auth/jwt.test.ts:50:12",
+      "    at verifyJwt (src/auth/jwt.ts:142:9)",
+    ].join("\n");
+    const tsEx = compactCommandExcerpt(tsFail, false, 180);
+    assert.ok(tsEx.length <= 180);
+    assert.ok(tsEx.includes("src/auth/jwt.ts:142:9"), `Expected non-test TS frame, got:\n${tsEx}`);
+
+    // Python failure: test_*.py appears before implementation .py file
+    const pyFail = [
+      "FAILED tests/test_retry.py::test_backoff",
+      '  File "tests/test_retry.py", line 24, in test_backoff',
+      '  File "src/worker/retry.py", line 67, in compute_backoff',
+      "  ValueError: backoff exceeded cap",
+    ].join("\n");
+    const pyEx = compactCommandExcerpt(pyFail, false, 180);
+    assert.ok(pyEx.length <= 180);
+    assert.ok(pyEx.includes("src/worker/retry.py"), `Expected non-test Python frame, got:\n${pyEx}`);
+  });
+
+  it("46. [V2.1-3] defaults compact_markdown to <= 720 chars with dense P1-focused excerpts while supporting larger explicit caps", () => {
+    assert.equal(DEFAULT_COMPACT_MAX_CHARS, 720);
+
+    // P1 density stop: once declarations fill >= 65% of cap, trailing P2 boilerplate is not packed
+    const denseSource = [
+      "export const SYNC_BATCH_SIZE = 64;",
+      "export const HEARTBEAT_SEC = 15;",
+      "export const RETRY_JITTER_MS = 200;",
+      "export interface SchedulerConfig {",
+      "  concurrency: number;",
+      "  drainTimeoutMs: number;",
+      "}",
+      "export function createScheduler(cfg: SchedulerConfig) {",
+      "  const internalTempA = cfg.concurrency + 1;",
+      "  const internalTempB = cfg.drainTimeoutMs * 2;",
+      "  const verboseBoilerplateLine = internalTempA + internalTempB;",
+      "  return verboseBoilerplateLine;",
+      "}",
+    ].join("\n");
+    const denseEx = compactCodeExcerpt(denseSource, 220);
+    assert.ok(denseEx.length <= 220);
+    assert.ok(denseEx.includes("SYNC_BATCH_SIZE = 64"));
+    assert.ok(denseEx.includes("HEARTBEAT_SEC = 15"));
+    assert.ok(
+      !denseEx.includes("verboseBoilerplateLine"),
+      `P1-dense excerpt should skip trailing P2 boilerplate:\n${denseEx}`,
+    );
+
+    const store = new GraphStore(":memory:");
+    const g = store.createGraph({ id: "g_default_720", name: "Default 720 Density" });
+    ingestToolArtifacts(store, g.id, [
+      {
+        callId: "d_r1",
+        tool: "read_file",
+        args: { path: "src/scheduler.ts" },
+        ok: true,
+        output: denseSource,
+      },
+      {
+        callId: "d_e1",
+        tool: "edit_file",
+        args: {
+          path: "src/scheduler.ts",
+          old_text: "export const SYNC_BATCH_SIZE = 64;",
+          new_text: "export const SYNC_BATCH_SIZE = 128;",
+        },
+        ok: true,
+        output: "Edited src/scheduler.ts",
+      },
+      {
+        callId: "d_bg1",
+        tool: "read_file",
+        args: { path: "src/banner.ts" },
+        ok: true,
+        output: "export const BANNER = 'hello';\n".repeat(15),
+      },
+      {
+        callId: "d_bg2",
+        tool: "read_file",
+        args: { path: "src/colors.ts" },
+        ok: true,
+        output: "export const PRIMARY = 'blue';\n".repeat(15),
+      },
+      {
+        callId: "d_fail",
+        tool: "bash",
+        args: { command: "npm test" },
+        ok: false,
+        output: [
+          "FAIL src/scheduler.test.ts > bounds batch size",
+          "  Error [ERR_BATCH_LIMIT]: batch 128 exceeded max 64",
+          "    at src/scheduler.test.ts:19:5",
+          "    at createScheduler (src/scheduler.ts:8:12)",
+        ].join("\n"),
+      },
+    ]);
+
+    const defaultRes = compileContext(store, {
+      graphId: g.id,
+      format: "compact_markdown",
+    });
+    assert.ok(
+      defaultRes.promptText.length > 0 && defaultRes.promptText.length <= 720,
+      `Default compact_markdown must be <= 720 chars, got ${defaultRes.promptText.length}`,
+    );
+    assert.ok(defaultRes.promptText.includes("ERR_BATCH_LIMIT"));
+    assert.ok(defaultRes.promptText.includes("src/scheduler.ts:8:12"));
+    assert.ok(defaultRes.promptText.includes("SYNC_BATCH_SIZE = 128"));
+    assert.ok(defaultRes.promptText.includes("- [other read files]:"));
+
+    // Explicit maxOutputChars up to 4000 still works
+    const expandedRes = compileContext(store, {
+      graphId: g.id,
+      format: "compact_markdown",
+      maxOutputChars: 2000,
+      recordCacheState: false,
+    });
+    assert.ok(expandedRes.promptText.length <= 2000);
+    assert.ok(expandedRes.promptText.includes("ERR_BATCH_LIMIT"));
+    store.close();
   });
 });

@@ -32,6 +32,122 @@ const ERROR_DIAG_RE =
 const APP_STACK_FRAME_RE =
   /(?:^\s*at\s+.*(?::\d+(?::\d+)?\)?$)|^\s*File\s+"[^"\n]+",\s+line\s+\d+|(?:^|[\s('"])(?:src|packages|apps|lib|server|client|api|cmd|pkg|internal|tests?|spec|bin)\/[^\s():'"\n]+\.\w+:\d+(?::\d+)?|\([^\s()\n]+\.\w+:\d+(?::\d+)?\))/i;
 
+const TEST_FILE_FRAME_RE =
+  /(?:\.(?:test|spec)\.[a-z0-9]+|_test\.[a-z0-9]+|(?:^|[\\/])test_[^\\/\s():'"\n]+\.[a-z0-9]+|(?:^|[\\/])__tests__[\\/])/i;
+
+const SOURCE_ROOT_PREFIXES = [
+  "packages/",
+  "apps/",
+  "src/",
+  "pkg/",
+  "lib/",
+  "internal/",
+  "cmd/",
+  "server/",
+  "client/",
+  "api/",
+  "bin/",
+] as const;
+
+const FILE_EXT_RE = /\.[A-Za-z][A-Za-z0-9]{0,7}$/;
+
+/**
+ * Strips trailing `:line` / `:line:col` / trailing `:` suffixes from a path token
+ * using a strictly linear O(N) backward scan.
+ */
+function stripLineColSuffix(token: string): string {
+  let end = token.length;
+  while (end > 0 && token.charCodeAt(end - 1) === 58) {
+    end--;
+  }
+  // Strip up to two `:digits` segments (`:line:col` or `:line`)
+  for (let pass = 0; pass < 2; pass++) {
+    let i = end;
+    while (i > 0) {
+      const c = token.charCodeAt(i - 1);
+      if (c >= 48 && c <= 57) i--;
+      else break;
+    }
+    if (i < end && i > 0 && token.charCodeAt(i - 1) === 58) {
+      end = i - 1;
+    } else {
+      break;
+    }
+  }
+  return end === token.length ? token : token.slice(0, end);
+}
+
+/**
+ * Strictly O(N) extractor returning deduplicated non-vendor relative application
+ * source file paths cited in failing command/test outputs (e.g. `src/...`,
+ * `packages/...`, `apps/...`, `pkg/...`, `lib/...`, `internal/...`, `cmd/...`),
+ * excluding `node_modules/` and `node:internal/`.
+ * Non-test source files are ordered ahead of test harness files.
+ */
+export function extractAppFileReferences(output: string): string[] {
+  if (!output) return [];
+  const clean = sanitizeNeutralText(output);
+  if (!clean) return [];
+
+  const nonTestRefs: string[] = [];
+  const testRefs: string[] = [];
+  const seen = new Set<string>();
+
+  const lines = clean.split("\n");
+  for (const rawLine of lines) {
+    if (!rawLine || VENDOR_STACK_FRAME_RE.test(rawLine)) continue;
+    const tokens = rawLine.split(/[\s()'"<>,;]+/);
+    for (const rawTok of tokens) {
+      if (!rawTok || rawTok.length < 4) continue;
+      let tok = rawTok.replace(/\\/g, "/");
+      if (tok.startsWith("file://")) {
+        tok = tok.slice("file://".length);
+      }
+      const lowerTok = tok.toLowerCase();
+      if (
+        lowerTok.includes("node_modules/") ||
+        lowerTok.startsWith("node:") ||
+        lowerTok.includes("internal/modules/")
+      ) {
+        continue;
+      }
+
+      const pathPart = stripLineColSuffix(tok);
+      if (!pathPart || !FILE_EXT_RE.test(pathPart)) continue;
+
+      // Find the earliest matching known source root prefix (so `packages/foo/src/a.ts`
+      // extracts `packages/foo/src/a.ts` rather than truncating to `src/a.ts`).
+      let bestStart = -1;
+      for (const prefix of SOURCE_ROOT_PREFIXES) {
+        let start = -1;
+        if (pathPart.startsWith(prefix)) {
+          start = 0;
+        } else {
+          const idx = pathPart.indexOf(`/${prefix}`);
+          if (idx >= 0) {
+            start = idx + 1;
+          }
+        }
+        if (start >= 0 && (bestStart === -1 || start < bestStart)) {
+          bestStart = start;
+        }
+      }
+
+      if (bestStart < 0) continue;
+      const rel = pathPart.slice(bestStart);
+      if (!rel || seen.has(rel)) continue;
+      seen.add(rel);
+      if (TEST_FILE_FRAME_RE.test(rel)) {
+        testRefs.push(rel);
+      } else {
+        nonTestRefs.push(rel);
+      }
+    }
+  }
+
+  return [...nonTestRefs, ...testRefs];
+}
+
 const PASS_SUMMARY_RE =
   /(?:\b\d+\s+(?:passed|passing|tests?\s+passed|specs?\s+passed|succeeded)\b|\bpass\s+\d+|\bPASS\b|\ball\s+\d+.*pass|\b0\s+errors?\b|\bbuild\s+succeeded\b|\bcompiled\s+successfully\b|^ok\s+\S+)/i;
 
@@ -378,20 +494,26 @@ export function compactCodeExcerpt(
     }
   }
 
-  // P2: meaningful head/body lines in source order
-  const p2 = classified.filter((c) => c.priority === 2);
-  for (const item of p2) {
-    if (cap - usedChars < 16) break;
-    if (!tryAdd(item.idx, item.text, selected.size === 0 || cap - usedChars >= 48)) {
-      if (cap - usedChars < 48) break;
-    }
-  }
+  // Once top-level declarations/constants (P1) fill >= 65% of cap, stop packing
+  // lower-priority P2 body boilerplate and P3 imports so excerpts stay dense.
+  const p1FilledEnough = p1.length > 0 && usedChars >= Math.floor(cap * 0.65);
 
-  // P3: imports only if space still remains
-  const p3 = classified.filter((c) => c.priority === 3);
-  for (const item of p3) {
-    if (cap - usedChars < 24) break;
-    tryAdd(item.idx, item.text, false);
+  if (!p1FilledEnough) {
+    // P2: meaningful head/body lines in source order
+    const p2 = classified.filter((c) => c.priority === 2);
+    for (const item of p2) {
+      if (cap - usedChars < 16) break;
+      if (!tryAdd(item.idx, item.text, selected.size === 0 || cap - usedChars >= 48)) {
+        if (cap - usedChars < 48) break;
+      }
+    }
+
+    // P3: imports only if space still remains
+    const p3 = classified.filter((c) => c.priority === 3);
+    for (const item of p3) {
+      if (cap - usedChars < 24) break;
+      tryAdd(item.idx, item.text, false);
+    }
   }
 
   if (selected.size === 0) {
@@ -492,7 +614,10 @@ export function compactCommandExcerpt(
     const isRedundantSummary = REDUNDANT_CMD_SUMMARY_RE.test(line);
     const isExplicitStackLine = /^\s*(?:at\s+\S|File\s+"[^"\n]+",\s+line\s+\d+)/.test(line);
     const isHeader = FAIL_HEADER_RE.test(line) && !isRedundantSummary;
-    const isFrame = APP_STACK_FRAME_RE.test(line) && !isRedundantSummary;
+    const hasCitedPathWithLine =
+      !isRedundantSummary && /:\d+/.test(line) && extractAppFileReferences(line).length > 0;
+    const isFrame =
+      (APP_STACK_FRAME_RE.test(line) && !isRedundantSummary) || hasCitedPathWithLine;
     const isDiag = ERROR_DIAG_RE.test(line) && !isRedundantSummary;
 
     if (isExplicitStackLine && isFrame) {
@@ -513,11 +638,12 @@ export function compactCommandExcerpt(
     }
   }
 
-  // Prefer a non-test application source frame when both app and test frames appear
+  // Strictly prefer a non-test application source frame (e.g. worker.go:118, jwt.ts:142)
+  // over test harness frames (*_test.go, *.test.ts, *.spec.ts, test_*.py)
   const primaryHeader = headers[0];
   const primaryDiag = diagnostics[0];
   const primaryFrame =
-    appFrames.find((f) => !/\.(?:test|spec)\.[a-z0-9]+:\d+/i.test(f)) ?? appFrames[0];
+    appFrames.find((f) => !TEST_FILE_FRAME_RE.test(f)) ?? appFrames[0];
 
   // If no structured failure signals were found, fall back cleanly to non-summary lines
   if (!primaryHeader && !primaryDiag && !primaryFrame) {

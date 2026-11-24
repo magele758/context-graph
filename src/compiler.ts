@@ -114,7 +114,7 @@ export const COMPILE_FORMATS: readonly CompileFormat[] = [
   "compact_markdown",
 ] as const;
 
-const DEFAULT_COMPACT_MAX_CHARS = 950 as const;
+export const DEFAULT_COMPACT_MAX_CHARS = 720 as const;
 const MAX_COMPACT_OUTPUT_CHARS = 4000 as const;
 const STALE_META_TAG_RE = /\(v\d+,[ \t]*[^,)\n]+,[ \t]*(?:ok|err|error|failed)\)/gi;
 
@@ -613,7 +613,7 @@ function compileCompactMarkdown(args: CompactMarkdownBuildArgs): CompileResult {
   if (tier1Nodes.length > 0 && remainingChars >= 1) {
     const tier1CapTotal =
       tier2Nodes.length > 0
-        ? Math.min(remainingChars, Math.max(360, Math.floor(remainingChars * 0.45)))
+        ? Math.min(remainingChars, Math.max(280, Math.floor(remainingChars * 0.45)))
         : remainingChars;
     const tier1Entries = tier1Nodes.map((n) => {
       const cmd =
@@ -622,8 +622,8 @@ function compileCompactMarkdown(args: CompactMarkdownBuildArgs): CompileResult {
           : (n.resourceKey?.replace(/^cmd:/, "") ?? n.id);
       const prefix = `- [check failed] \`${cmd}\`: `;
       const desiredBody = truncateAtWordBoundary(
-        flattenCommandLines(compactCommandExcerpt(n.content, false, 314)),
-        320,
+        flattenCommandLines(compactCommandExcerpt(n.content, false, 254)),
+        260,
       );
       return {
         node: n,
@@ -703,11 +703,11 @@ function compileCompactMarkdown(args: CompactMarkdownBuildArgs): CompileResult {
     return { line: `${prefix}${pickedParts.join(", ")}`, included };
   };
 
-  // --- Tier 2: Edited scopes, #edit deltas, ranged chunks, failed-edit target files, decisions ---
+  // --- Tier 2: Edited scopes, #edit deltas, ranged chunks, failed-edit/failure-cited files, decisions ---
   if (tier2Nodes.length > 0 && remainingChars >= 1) {
     const previewOther = buildOtherReadFilesLine(140);
     const otherReserve =
-      previewOther && remainingChars - (previewOther.line.length + 1) >= tier2Nodes.length * 160
+      previewOther && remainingChars - (previewOther.line.length + 1) >= tier2Nodes.length * 140
         ? previewOther.line.length + 1
         : 0;
     const tier2BudgetPool = Math.max(0, remainingChars - otherReserve);
@@ -753,7 +753,7 @@ function compileCompactMarkdown(args: CompactMarkdownBuildArgs): CompileResult {
 
     const tier2Entries = tier2Nodes.map((n) => {
       const prefix = buildTier2Prefix(n);
-      const cap = isFileErrorNode(n) ? 160 : 340;
+      const cap = isFileErrorNode(n) ? 140 : 240;
       const desiredBody = renderTier2Body(n, cap);
       return {
         node: n,
@@ -1351,7 +1351,12 @@ export function compileContext(store: GraphStore, options: CompileOptions): Comp
 
   const editedFileScopes = new Set<string>();
   const errorTargetFileScopes = new Set<string>();
+  const failureCitedNodeIds = new Set<string>();
+  const failureCitedFileScopes = new Set<string>();
+  const activeNodeById = new Map<string, GraphNode>();
+
   for (const n of activeNodes) {
+    activeNodeById.set(n.id, n);
     const scopeKey = getFileScopeKey(n);
     if (!scopeKey) continue;
     if (
@@ -1366,10 +1371,50 @@ export function compileContext(store: GraphStore, options: CompileOptions): Comp
       errorTargetFileScopes.add(scopeKey);
     }
   }
-  const priorityFileScopes = new Set<string>([...editedFileScopes, ...errorTargetFileScopes]);
+
+  // Elevate active file nodes directly depended upon or cited by an active unresolvedFailure command
+  for (const n of activeNodes) {
+    if (n.metadata.unresolvedFailure !== true) continue;
+    const deps = activeDependsOn.get(n.id);
+    if (deps) {
+      for (const depId of deps) {
+        const depNode = activeNodeById.get(depId);
+        if (depNode && isFileArtifactNode(depNode)) {
+          failureCitedNodeIds.add(depNode.id);
+          const sk = getFileScopeKey(depNode);
+          if (sk) failureCitedFileScopes.add(sk);
+        }
+      }
+    }
+    const cited = n.metadata.citedFilePaths;
+    if (Array.isArray(cited)) {
+      for (const rawRef of cited) {
+        if (typeof rawRef !== "string" || !rawRef) continue;
+        for (const cand of activeNodes) {
+          if (!isFileArtifactNode(cand)) continue;
+          const p = getFileDisplayPath(cand);
+          if (p === rawRef || p.endsWith(`/${rawRef}`)) {
+            failureCitedNodeIds.add(cand.id);
+            const sk = getFileScopeKey(cand);
+            if (sk) failureCitedFileScopes.add(sk);
+          }
+        }
+      }
+    }
+  }
+
+  const priorityFileScopes = new Set<string>([
+    ...editedFileScopes,
+    ...errorTargetFileScopes,
+    ...failureCitedFileScopes,
+  ]);
 
   const isPriorityFileNode = (n: GraphNode): boolean => {
-    if (n.metadata.editedScope === true || n.metadata.fileOpKind === "ranged_read") {
+    if (
+      n.metadata.editedScope === true ||
+      n.metadata.fileOpKind === "ranged_read" ||
+      failureCitedNodeIds.has(n.id)
+    ) {
       return true;
     }
     if (isFileArtifactNode(n)) {

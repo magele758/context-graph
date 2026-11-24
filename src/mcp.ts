@@ -196,7 +196,7 @@ export const MCP_TOOLS = [
         },
         maxOutputChars: {
           type: "integer",
-          description: "Maximum output character budget for compact_markdown format (default: 950, max: 4000).",
+          description: "Maximum output character budget for compact_markdown format (default: 720, max: 4000).",
         },
       },
       required: ["graphId"],

@@ -1,6 +1,7 @@
 import {
   compactCodeExcerpt,
   compactCommandExcerpt,
+  extractAppFileReferences,
   sanitizeNeutralText,
   truncateAtWordBoundary,
 } from "./excerpt.ts";
@@ -46,6 +47,15 @@ const SEARCH_TOOLS = new Set([
   "find_by_name",
   "grep_search",
 ]);
+
+const WRITE_PAYLOAD_ARG_KEYS = [
+  "content",
+  "CodeContent",
+  "text",
+  "data",
+  "body",
+  "file_content",
+] as const;
 
 const DEFAULT_CODE_EXCERPT_CHARS = 600;
 const DEFAULT_CMD_EXCERPT_CHARS = 420;
@@ -777,16 +787,42 @@ export function pruneTrajectoryEvents(
     const ev = events[i]!;
     const mark = pruneMarks.get(i);
     if (mark) {
+      const c = classified[i]!;
       const origOutput = ev.output ?? "";
+      let eventOrigChars = origOutput.length;
       prunedCallIds.push(ev.callId);
       charsSaved += Math.max(0, origOutput.length - mark.stub.length);
       tokensSaved += Math.max(0, countTokens(origOutput) - countTokens(mark.stub));
+
+      // On superseded full_write events, also prune large inline payload fields inside a cloned `args`
+      let prunedArgs: Record<string, unknown> | undefined;
+      if (
+        c.family === "file" &&
+        c.fileOpKind === "full_write" &&
+        ev.args &&
+        isPlainObject(ev.args)
+      ) {
+        for (const key of WRITE_PAYLOAD_ARG_KEYS) {
+          const val = ev.args[key];
+          if (typeof val === "string" && val.length > mark.stub.length) {
+            if (!prunedArgs) {
+              prunedArgs = { ...ev.args };
+            }
+            prunedArgs[key] = mark.stub;
+            eventOrigChars += val.length;
+            charsSaved += val.length - mark.stub.length;
+            tokensSaved += Math.max(0, countTokens(val) - countTokens(mark.stub));
+          }
+        }
+      }
+
       outEvents.push({
         ...ev,
+        ...(prunedArgs ? { args: prunedArgs } : {}),
         output: mark.stub,
         pruned: true,
         supersededByCallId: mark.supersededByCallId,
-        originalChars: origOutput.length,
+        originalChars: eventOrigChars,
       });
     } else {
       outEvents.push({
@@ -822,7 +858,7 @@ function extractWriteContent(
   args: Record<string, unknown> | undefined,
   output: string,
 ): string {
-  const argContent = readRawStringArg(args, ["content", "CodeContent", "text", "data"]);
+  const argContent = readRawStringArg(args, WRITE_PAYLOAD_ARG_KEYS);
   if (argContent && argContent.trim().length > 0) {
     return argContent;
   }
@@ -1207,8 +1243,47 @@ export function ingestToolArtifacts(
         (ok ? `${c.command}: ok` : `${c.command}: failed`);
       const summary = truncateAtWordBoundary(excerpt, 240);
       const stub = `${c.command}: ${ok ? "ok" : "failed"}`;
+
+      // Link active failing command to both cited read/active files in its stack trace
+      // and recent edited files via `depends_on` edges.
+      const citedFilePaths = !ok ? extractAppFileReferences(effectiveEvent.output) : [];
+      const citedNodeIds: string[] = [];
+      if (!ok && citedFilePaths.length > 0) {
+        const evMachine = effectiveEvent.machineId?.trim();
+        for (const refPath of citedFilePaths) {
+          const directKey = evMachine ? `file:${evMachine}:${refPath}` : `file:${refPath}`;
+          const directMatches = activeByResourceKey.get(directKey);
+          if (directMatches && directMatches.length > 0) {
+            for (const m of directMatches) {
+              if (!citedNodeIds.includes(m.id)) citedNodeIds.push(m.id);
+            }
+            continue;
+          }
+          // Suffix/scoped fallback matching active `file:` nodes (incl. ranged reads or absolute paths)
+          for (const [rk, list] of activeByResourceKey) {
+            if (!rk.startsWith("file:")) continue;
+            for (const m of list) {
+              const nodePath =
+                typeof m.metadata.path === "string"
+                  ? m.metadata.path
+                  : rk.slice("file:".length).replace(/#(?:edit|range=.*)$/, "");
+              if (evMachine) {
+                const sk = typeof m.metadata.fileScopeKey === "string" ? m.metadata.fileScopeKey : "";
+                if (!sk.startsWith(`${evMachine}:`)) continue;
+              }
+              if (nodePath === refPath || nodePath.endsWith(`/${refPath}`)) {
+                if (!citedNodeIds.includes(m.id)) citedNodeIds.push(m.id);
+              }
+            }
+          }
+          if (citedNodeIds.length >= 6) break;
+        }
+      }
+
       const dependsOn = !ok
-        ? Array.from(new Set(recentEditedFileNodeIds.slice(-4))).filter((id) => id !== nodeId)
+        ? Array.from(new Set([...citedNodeIds.slice(0, 6), ...recentEditedFileNodeIds.slice(-4)])).filter(
+            (id) => id !== nodeId,
+          )
         : undefined;
 
       const node = store.addNode(graphId, {
@@ -1229,6 +1304,7 @@ export function ingestToolArtifacts(
           unresolvedFailure: !ok,
           command: c.command,
           status: ok ? "ok" : "failed",
+          ...(citedFilePaths.length > 0 ? { citedFilePaths } : {}),
           tool: effectiveEvent.tool,
           ok,
           callId: effectiveEvent.callId,
