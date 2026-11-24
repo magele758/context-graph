@@ -319,6 +319,13 @@ export interface KvCacheMetrics {
   effectiveBillableTokens: number;
 }
 
+export type CompileFormat =
+  | "both"
+  | "messages"
+  | "prompt"
+  | "xml"
+  | "compact_markdown";
+
 export interface CompileOptions {
   graphId: string;
   focusQuery?: string;
@@ -328,9 +335,79 @@ export interface CompileOptions {
   zone1MaxRatio?: number;
   pprAlpha?: number;
   pprIterations?: number;
-  format?: "both" | "messages" | "prompt";
+  format?: CompileFormat;
+  maxOutputChars?: number;
   recordCacheState?: boolean;
   previousTokenIds?: number[];
+}
+
+export type ToolFamily = "file" | "command" | "search" | "other";
+
+export type FileOpKind =
+  | "full_read"
+  | "ranged_read"
+  | "partial_edit"
+  | "full_write"
+  | "delete";
+
+export interface ToolTrajectoryEvent {
+  callId: string;
+  tool: string;
+  args?: Record<string, unknown>;
+  ok: boolean;
+  output: string;
+  seq?: number;
+  turn?: number;
+  machineId?: string;
+  scope?: string;
+}
+
+export interface ClassifiedToolEvent {
+  event: ToolTrajectoryEvent;
+  family: ToolFamily;
+  fileOpKind?: FileOpKind;
+  path?: string;
+  fileScopeKey?: string;
+  rangeKey?: string;
+  rangeLabel?: string;
+  diffText?: string;
+  command?: string;
+  searchKey?: string;
+  resourceKey: string | null;
+  displayLabel: string;
+}
+
+export interface PrunedTrajectoryEvent extends ToolTrajectoryEvent {
+  pruned: boolean;
+  supersededByCallId?: string;
+  originalChars?: number;
+}
+
+export interface PruneTrajectoryResult {
+  events: PrunedTrajectoryEvent[];
+  prunedCallIds: string[];
+  prunedCount: number;
+  charsSaved: number;
+  tokensSaved: number;
+}
+
+export interface IngestArtifactsOptions {
+  scope?: string;
+  turn?: number;
+  machineId?: string;
+  maxCodeExcerptChars?: number;
+  maxCommandExcerptChars?: number;
+}
+
+export interface IngestArtifactsResult {
+  graphId: string;
+  ingestedCount: number;
+  skippedCount: number;
+  addedNodes: GraphNode[];
+  addedEdges: GraphEdge[];
+  supersededNodeIds: string[];
+  activeFileScopes: string[];
+  unresolvedFailureNodeIds: string[];
 }
 
 export interface CompileResult {

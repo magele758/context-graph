@@ -4,9 +4,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { after, before, describe, it } from "node:test";
+import {
+  classifyToolEvent,
+  ingestToolArtifacts,
+  normalizeCommandKey,
+  pruneTrajectoryEvents,
+} from "./artifact-engine.ts";
 import { runBenchmark } from "./benchmark.ts";
 import { runCli } from "./cli.ts";
 import { compileContext } from "./compiler.ts";
+import {
+  compactCodeExcerpt,
+  compactCommandExcerpt,
+  sanitizeNeutralText,
+  truncateAtWordBoundary,
+} from "./excerpt.ts";
 import { GraphStore } from "./graph-store.ts";
 import { ContextGraphMcpSession, handleMcpJsonRpc, MCP_TOOLS, startMcpStdioServer } from "./mcp.ts";
 import {
@@ -14,7 +26,12 @@ import {
   isLoopbackHost,
   type ContextGraphServerInstance,
 } from "./server.ts";
-import { ContextGraphError, CycleDetectedError, NotFoundError } from "./types.ts";
+import {
+  ContextGraphError,
+  CycleDetectedError,
+  NotFoundError,
+  type ToolTrajectoryEvent,
+} from "./types.ts";
 import {
   cosineSimilarity,
   countTokens,
@@ -579,7 +596,7 @@ describe("HTTP REST Microservice End-to-End", () => {
 });
 
 describe("MCP JSON-RPC 2.0 Server & Stdio Transport", () => {
-  it("18. completes MCP handshake and lists all 6 Context Graph tools", () => {
+  it("18. completes MCP handshake and lists all 7 Context Graph tools", () => {
     const store = new GraphStore(":memory:");
     const session = new ContextGraphMcpSession(store);
 
@@ -603,13 +620,14 @@ describe("MCP JSON-RPC 2.0 Server & Stdio Transport", () => {
       id: 2,
       method: "tools/list",
     }) as { result: { tools: typeof MCP_TOOLS } };
-    assert.equal(listResp.result.tools.length, 6);
+    assert.equal(listResp.result.tools.length, 7);
     const names = listResp.result.tools.map((t) => t.name);
     assert.deepEqual(names, [
       "cg_create_graph",
       "cg_add_node",
       "cg_link_nodes",
       "cg_ingest_turn",
+      "cg_ingest_artifacts",
       "cg_compile_context",
       "cg_export_mermaid",
     ]);
@@ -1059,7 +1077,7 @@ describe("Bearer Auth, Fail-Closed Protection & Streamable HTTP /mcp", () => {
       assert.equal(notifRes.status, 202);
       assert.equal(await notifRes.text(), "");
 
-      // 3. POST /mcp tools/list -> 200 with all 6 tools
+      // 3. POST /mcp tools/list -> 200 with all 7 tools
       const listRes = await fetch(`${bound.url}/mcp`, {
         method: "POST",
         headers: sessionHeaders,
@@ -1073,9 +1091,10 @@ describe("Bearer Auth, Fail-Closed Protection & Streamable HTTP /mcp", () => {
       const listBody = (await listRes.json()) as {
         result: { tools: Array<{ name: string }> };
       };
-      assert.equal(listBody.result.tools.length, 6);
+      assert.equal(listBody.result.tools.length, 7);
       assert.ok(listBody.result.tools.some((t) => t.name === "cg_create_graph"));
       assert.ok(listBody.result.tools.some((t) => t.name === "cg_ingest_turn"));
+      assert.ok(listBody.result.tools.some((t) => t.name === "cg_ingest_artifacts"));
       assert.ok(listBody.result.tools.some((t) => t.name === "cg_compile_context"));
 
       // 4. POST /mcp tools/call -> cg_create_graph
@@ -1230,6 +1249,825 @@ describe("Bearer Auth, Fail-Closed Protection & Streamable HTTP /mcp", () => {
       });
       assert.equal(delMcpRes.status, 200);
       assert.deepEqual(await delMcpRes.json(), { ok: true });
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe("v0.2 Declaration-Aware Excerpt & App-Frame Command Engine (`src/excerpt.ts`)", () => {
+  it("27. sanitizes upstream truncation and pruned markers cleanly while preserving line structure", () => {
+    const dirty = [
+      "export const RETRY_LIMIT = 5;",
+      "[pruned 1234 chars; head/tail shown]",
+      "export const SYNC_WINDOW_MS = 2500; …[pruned 88 chars]",
+      "const tail = true; [pruned 42 chars] // done",
+    ].join("\n");
+
+    const clean = sanitizeNeutralText(dirty);
+    assert.ok(!clean.includes("[pruned"));
+    assert.ok(!clean.includes("head/tail shown"));
+    assert.ok(clean.includes("export const RETRY_LIMIT = 5;"));
+    assert.ok(clean.includes("export const SYNC_WINDOW_MS = 2500;"));
+    assert.ok(clean.includes("const tail = true; // done"));
+  });
+
+  it("28. truncates strictly at word/line/punctuation boundaries without slicing numbers or identifiers", () => {
+    // Must NEVER slice `@line 41` into `@line 4`
+    const lineMsg = "Failure reported at @line 41 in module dispatcher";
+    const cutNum = truncateAtWordBoundary(lineMsg, 31); // "... @line 4" would be 27 + 4 = 31
+    assert.ok(cutNum.length <= 31);
+    assert.ok(!cutNum.includes("@line 4 "), `Must not slice number 41 -> 4: ${cutNum}`);
+    assert.ok(!cutNum.endsWith("@line 4 ..."), `Must not slice number 41 -> 4: ${cutNum}`);
+
+    // Must NEVER slice `SYNC_WINDOW_MS` into `SYNC_WIN`
+    const declMsg = "export const SYNC_WINDOW_MS = 3000; export const NEXT = 1;";
+    const cutId = truncateAtWordBoundary(declMsg, 26);
+    assert.ok(cutId.length <= 26);
+    assert.ok(!cutId.includes("SYNC_WIN"), `Must not slice identifier mid-token: ${cutId}`);
+
+    // Must NEVER slice decimal `0.0825` into `0.08` or `0.`
+    const decMsg = "ratio = 0.0825 applied to subtotal";
+    const cutDec = truncateAtWordBoundary(decMsg, 16);
+    assert.ok(cutDec.length <= 16);
+    assert.ok(!cutDec.includes("0.08"), `Must not slice decimal literal: ${cutDec}`);
+    assert.ok(!cutDec.includes("0. ..."), `Must not break on decimal point: ${cutDec}`);
+
+    // Must NEVER slice path:line `src/router.ts:41:9` mid-line-number
+    const frameMsg = "at dispatch (src/router.ts:41:9) during request";
+    const cutFrame = truncateAtWordBoundary(frameMsg, 34);
+    assert.ok(cutFrame.length <= 34);
+    assert.ok(!cutFrame.includes("src/router.ts:4 "), `Must not slice line number: ${cutFrame}`);
+  });
+
+  it("29. prioritizes top-level declarations/constants over imports and trailing braces in compactCodeExcerpt", () => {
+    const source = [
+      "// Router dispatch policy",
+      "import { EventEmitter } from 'node:events';",
+      "import { readFileSync } from 'node:fs';",
+      "import { createHash } from 'node:crypto';",
+      "import { join, resolve } from 'node:path';",
+      "",
+      "export const BACKOFF_BASE_MS = 250;",
+      "export const MAX_QUEUE_DEPTH = 128;",
+      "export interface RoutePolicy {",
+      "  timeoutMs: number;",
+      "  strictMode: boolean;",
+      "}",
+      "export function dispatchRoute(path: string, policy: RoutePolicy): boolean {",
+      "  const normalized = path.trim();",
+      "  for (let i = 0; i < 10; i++) {",
+      "    if (normalized.length > i) {",
+      "      // filler body line",
+      "    }",
+      "  }",
+      "  return normalized.length > 0;",
+      "}",
+      "function trailingHelper() {",
+      "  return [",
+      "    1,",
+      "    2,",
+      "  ];",
+      "}",
+    ].join("\n");
+
+    const excerpt = compactCodeExcerpt(source, 260);
+    assert.ok(excerpt.length <= 260, `Expected <= 260 chars, got ${excerpt.length}`);
+    assert.ok(excerpt.includes("export const BACKOFF_BASE_MS = 250;"));
+    assert.ok(excerpt.includes("export const MAX_QUEUE_DEPTH = 128;"));
+    assert.ok(excerpt.includes("export interface RoutePolicy"));
+    assert.ok(excerpt.includes("export function dispatchRoute"));
+    assert.ok(!excerpt.includes("trailingHelper"), "Should not waste budget on trailing boilerplate");
+
+    // diffText mode strips boilerplate ack lines
+    const diffExcerpt = compactCodeExcerpt("Edited src/router.ts", 200, {
+      diffText: "Edited src/router.ts\nWrote src/router.ts (512 bytes)\n- export const MAX_QUEUE_DEPTH = 128;\n+ export const MAX_QUEUE_DEPTH = 256;",
+    });
+    assert.ok(!diffExcerpt.includes("Edited src/router.ts"));
+    assert.ok(!diffExcerpt.includes("Wrote src/router.ts"));
+    assert.ok(diffExcerpt.includes("- export const MAX_QUEUE_DEPTH = 128;"));
+    assert.ok(diffExcerpt.includes("+ export const MAX_QUEUE_DEPTH = 256;"));
+  });
+
+  it("30. preserves FAIL header, primary diagnostics, and app source frame while stripping node_modules in compactCommandExcerpt", () => {
+    const noisyFailure = [
+      "> svc@1.0.0 test",
+      "> vitest run",
+      "FAIL src/router.test.ts > rejects stale nonce header",
+      "  Error [ERR_NONCE_EXPIRED]: request nonce exceeded 300s replay window",
+      "    at validateNonce (src/router.ts:41:11)",
+      "    at processTicksAndRejections (node:internal/process/task_queues:95:5)",
+      "    at runTest (node_modules/vitest/dist/chunk-runner.js:1284:12)",
+      "    at async node_modules/tinypool/dist/worker.js:88:19",
+      "Test Files  1 failed (1)",
+      "Tests  1 failed | 17 passed (18)",
+      "Command exited with code 1",
+    ].join("\n");
+
+    const compactFail = compactCommandExcerpt(noisyFailure, false, 240);
+    assert.ok(compactFail.length <= 240, `Expected <= 240 chars, got ${compactFail.length}`);
+    assert.ok(compactFail.includes("FAIL src/router.test.ts"), `Missing FAIL header: ${compactFail}`);
+    assert.ok(compactFail.includes("ERR_NONCE_EXPIRED"), `Missing error code: ${compactFail}`);
+    assert.ok(compactFail.includes("src/router.ts:41:11"), `Missing app stack frame: ${compactFail}`);
+    assert.ok(!compactFail.includes("node_modules/"), "Must strip node_modules stack frames");
+    assert.ok(!compactFail.includes("node:internal/"), "Must strip node:internal stack frames");
+    assert.ok(!compactFail.includes("Command exited with code 1"), "Should drop redundant exit banner");
+
+    // Tight budget still preserves diagnostic + app source frame
+    const tightFail = compactCommandExcerpt(noisyFailure, false, 130);
+    assert.ok(tightFail.length <= 130);
+    assert.ok(tightFail.includes("ERR_NONCE_EXPIRED"));
+    assert.ok(tightFail.includes("src/router.ts:41:11"));
+
+    // Passing command returns concise 1-line summary <= 120 chars
+    const passOutput = [
+      "> svc@1.0.0 test",
+      "> vitest run",
+      " ✓ src/router.test.ts (18 tests) 42ms",
+      "Tests  18 passed (18)",
+    ].join("\n");
+    const compactPass = compactCommandExcerpt(passOutput, true, 300);
+    assert.ok(compactPass.length <= 120);
+    assert.ok(!compactPass.includes("\n"));
+    assert.ok(compactPass.includes("18 passed"));
+  });
+});
+
+describe("v0.2 Tool-Trajectory Classifier, Pruner & Artifact DAG Engine (`src/artifact-engine.ts`)", () => {
+  it("31. classifies known tool families strictly, ignores unknown tools with path, and preserves monorepo cd scoping", () => {
+    const unknownWithPath = classifyToolEvent({
+      callId: "u1",
+      tool: "http_fetch",
+      args: { path: "/v1/orders", method: "GET" },
+      ok: true,
+      output: '{"ok":true}',
+    });
+    assert.equal(unknownWithPath.family, "other");
+    assert.equal(unknownWithPath.resourceKey, null);
+
+    // Monorepo cd scoping preserved while no-op cd . && / cd $PWD && stripped
+    assert.equal(normalizeCommandKey("cd . && npm test"), "npm test");
+    assert.equal(normalizeCommandKey('cd "$PWD" &&  npm   test'), "npm test");
+    assert.equal(normalizeCommandKey("cd packages/alpha/ && npm test"), "cd packages/alpha && npm test");
+    assert.notEqual(
+      normalizeCommandKey("cd packages/alpha && npm test"),
+      normalizeCommandKey("cd packages/beta && npm test"),
+    );
+
+    const cmdA = classifyToolEvent({
+      callId: "cA",
+      tool: "bash",
+      args: { command: "cd packages/alpha && npm test" },
+      ok: true,
+      output: "ok",
+    });
+    const cmdB = classifyToolEvent({
+      callId: "cB",
+      tool: "bash",
+      args: { command: "cd packages/beta && npm test" },
+      ok: true,
+      output: "ok",
+    });
+    assert.equal(cmdA.family, "command");
+    assert.notEqual(cmdA.resourceKey, cmdB.resourceKey);
+
+    // machineId isolates same path across hosts
+    const m1 = classifyToolEvent({
+      callId: "m1",
+      tool: "read_file",
+      args: { path: "src/config.ts" },
+      machineId: "host-a",
+      ok: true,
+      output: "export const A = 1;",
+    });
+    const m2 = classifyToolEvent({
+      callId: "m2",
+      tool: "read_file",
+      args: { path: "src/config.ts" },
+      machineId: "host-b",
+      ok: true,
+      output: "export const A = 2;",
+    });
+    assert.equal(m1.resourceKey, "file:host-a:src/config.ts");
+    assert.equal(m2.resourceKey, "file:host-b:src/config.ts");
+  });
+
+  it("32. enforces all trajectory pruning invariants purely without mutating inputs", () => {
+    const events: ToolTrajectoryEvent[] = [
+      // Base read -> partial edit -> MUST keep both unpruned until a full_read supersedes them
+      { callId: "r1", tool: "read_file", args: { path: "src/worker.ts" }, ok: true, output: "export const W = 1;\n".repeat(15) },
+      { callId: "e1", tool: "edit_file", args: { path: "src/worker.ts", old_text: "W = 1", new_text: "W = 2" }, ok: true, output: "Edited src/worker.ts" },
+      // Disjoint ranged reads on src/big.ts -> NEVER prune each other
+      { callId: "rg1", tool: "read_file", args: { path: "src/big.ts", start_line: 1, end_line: 50 }, ok: true, output: "chunk 1 content ".repeat(10) },
+      { callId: "rg2", tool: "read_file", args: { path: "src/big.ts", start_line: 51, end_line: 100 }, ok: true, output: "chunk 2 content ".repeat(10) },
+      // Identical range re-read -> prunes ONLY rg1, keeps rg2!
+      { callId: "rg1b", tool: "read_file", args: { path: "src/big.ts", start_line: 1, end_line: 50 }, ok: true, output: "chunk 1 refreshed" },
+      // Failed edit on src/guard.ts MUST NEVER prune prior valid read_file
+      { callId: "g_read", tool: "read_file", args: { path: "src/guard.ts" }, ok: true, output: "export const GUARD_MODE = 'strict';" },
+      { callId: "g_err", tool: "edit_file", args: { path: "src/guard.ts", old_text: "missing", new_text: "x" }, ok: false, output: "Error: target not found" },
+      // Monorepo commands: alpha re-run prunes alpha#1, does NOT prune beta#1
+      { callId: "t_a1", tool: "bash", args: { command: "cd packages/alpha && npm test" }, ok: false, output: "FAIL alpha\n".repeat(12) },
+      { callId: "t_b1", tool: "bash", args: { command: "cd packages/beta && npm test" }, ok: true, output: "PASS beta" },
+      { callId: "t_a2", tool: "bash", args: { command: "cd packages/alpha && npm test" }, ok: true, output: "PASS alpha" },
+    ];
+
+    const snapshotBefore = JSON.stringify(events);
+    const res = pruneTrajectoryEvents(events);
+    assert.equal(JSON.stringify(events), snapshotBefore, "Input array must remain unmutated");
+
+    const prunedSet = new Set(res.prunedCallIds);
+    assert.ok(!prunedSet.has("r1"), "partial_edit must NEVER prune preceding read_file");
+    assert.ok(!prunedSet.has("e1"));
+    assert.ok(prunedSet.has("rg1"), "identical ranged_read must prune older identical range");
+    assert.ok(!prunedSet.has("rg2"), "disjoint ranged_read must NEVER be pruned");
+    assert.ok(!prunedSet.has("g_read"), "failed file op must NEVER prune valid read_file");
+    assert.ok(!prunedSet.has("g_err"));
+    assert.ok(prunedSet.has("t_a1"), "newer identical command must prune older run");
+    assert.ok(!prunedSet.has("t_b1"), "different monorepo cd command must stay isolated");
+    assert.ok(res.charsSaved > 0);
+    assert.ok(res.tokensSaved > 0);
+
+    const prunedRg1 = res.events.find((e) => e.callId === "rg1")!;
+    assert.equal(prunedRg1.pruned, true);
+    assert.match(prunedRg1.output, /^\[superseded: newer ranged_read on file:src\/big\.ts#range=1-50\]$/);
+
+    // Adding a full_read on src/worker.ts supersedes BOTH r1 and e1
+    const withFull = pruneTrajectoryEvents([
+      ...events,
+      { callId: "r2", tool: "read_file", args: { path: "src/worker.ts" }, ok: true, output: "export const W = 2;" },
+    ]);
+    assert.ok(withFull.prunedCallIds.includes("r1"));
+    assert.ok(withFull.prunedCallIds.includes("e1"));
+  });
+
+  it("33. ingests tool artifacts idempotently across 2-round multi-compaction with cross-compaction cleanup", () => {
+    const store = new GraphStore(":memory:");
+    const g = store.createGraph({ id: "g_art", name: "Artifact Engine Test" });
+
+    // Round 1: read -> partial_edit + disjoint ranged reads + failed edit on another file + failing test
+    const round1: ToolTrajectoryEvent[] = [
+      {
+        callId: "c1",
+        tool: "read_file",
+        args: { path: "src/worker.ts" },
+        ok: true,
+        output: "export const POLL_MS = 1000;\nexport function tick() { return POLL_MS; }",
+      },
+      {
+        callId: "c2",
+        tool: "edit_file",
+        args: {
+          path: "src/worker.ts",
+          old_text: "export const POLL_MS = 1000;",
+          new_text: "export const POLL_MS = 2500;",
+        },
+        ok: true,
+        output: "Edited src/worker.ts",
+      },
+      {
+        callId: "c3",
+        tool: "read_file",
+        args: { path: "src/chunks.ts", start_line: 1, end_line: 40 },
+        ok: true,
+        output: "export const CHUNK_A = 1;",
+      },
+      {
+        callId: "c4",
+        tool: "read_file",
+        args: { path: "src/chunks.ts", start_line: 41, end_line: 80 },
+        ok: true,
+        output: "export const CHUNK_B = 2;",
+      },
+      {
+        callId: "c5",
+        tool: "read_file",
+        args: { path: "src/guard.ts" },
+        ok: true,
+        output: "export const STRICT_GUARD = true;",
+      },
+      {
+        callId: "c6",
+        tool: "edit_file",
+        args: { path: "src/guard.ts", old_text: "nope", new_text: "yes" },
+        ok: false,
+        output: "Error: old_text not found in src/guard.ts",
+      },
+      {
+        callId: "c7",
+        tool: "bash",
+        args: { command: "npm test" },
+        ok: false,
+        output: "FAIL src/worker.test.ts\nError [ERR_POLL_DRIFT]: expected 2500\n  at tick (src/worker.ts:2:10)",
+      },
+    ];
+
+    const r1 = ingestToolArtifacts(store, g.id, round1, { turn: 1 });
+    assert.equal(r1.ingestedCount, 7);
+    assert.equal(r1.unresolvedFailureNodeIds.length, 1);
+
+    // Base read_file + #edit delta are BOTH active for src/worker.ts
+    const activeWorkerR1 = store
+      .listNodes(g.id, { status: "active" })
+      .filter((n) => n.metadata.fileScopeKey === "src/worker.ts");
+    assert.equal(activeWorkerR1.length, 2);
+    assert.ok(activeWorkerR1.some((n) => n.resourceKey === "file:src/worker.ts"));
+    assert.ok(activeWorkerR1.some((n) => n.resourceKey === "file:src/worker.ts#edit"));
+
+    // Failed edit stored under file_err:src/guard.ts and does NOT supersede file:src/guard.ts
+    const activeGuardR1 = store
+      .listNodes(g.id, { status: "active" })
+      .filter((n) => n.metadata.fileScopeKey === "src/guard.ts");
+    assert.equal(activeGuardR1.length, 2);
+    assert.ok(activeGuardR1.some((n) => n.resourceKey === "file:src/guard.ts"));
+    assert.ok(activeGuardR1.some((n) => n.resourceKey === "file_err:src/guard.ts"));
+
+    // Shifted overlapping retry window MUST be 100% idempotent (c2..c7 skipped, zero errors)
+    const retryOverlap = ingestToolArtifacts(store, g.id, round1.slice(2), { turn: 1 });
+    assert.equal(retryOverlap.ingestedCount, 0);
+    assert.equal(retryOverlap.skippedCount, 5);
+
+    // Round 2 (multi-compaction): verification full_read of src/worker.ts + full_write of src/chunks.ts + passing npm test
+    const round2: ToolTrajectoryEvent[] = [
+      {
+        callId: "c8",
+        tool: "read_file",
+        args: { path: "src/worker.ts" },
+        ok: true,
+        output: "export const POLL_MS = 2500;\nexport function tick() { return POLL_MS; }",
+      },
+      {
+        callId: "c9",
+        tool: "write_file",
+        args: {
+          path: "src/chunks.ts",
+          content: "export const CHUNK_A = 10;\nexport const CHUNK_B = 20;",
+        },
+        ok: true,
+        output: "Wrote src/chunks.ts",
+      },
+      {
+        callId: "c10",
+        tool: "bash",
+        args: { command: "npm test" },
+        ok: true,
+        output: "Tests  12 passed (12)",
+      },
+    ];
+
+    const r2 = ingestToolArtifacts(store, g.id, round2, { turn: 2 });
+    assert.equal(r2.ingestedCount, 3);
+    assert.equal(r2.unresolvedFailureNodeIds.length, 0, "Passing test must supersede failing test");
+
+    // Verification read of src/worker.ts MUST supersede BOTH old base AND Round 1 #edit in SQLite,
+    // while retaining salience >= 0.90 and editedScope: true!
+    const workerNodes = store
+      .listNodes(g.id)
+      .filter((n) => n.metadata.fileScopeKey === "src/worker.ts");
+    const activeWorkerR2 = workerNodes.filter((n) => n.status === "active");
+    assert.equal(activeWorkerR2.length, 1);
+    assert.equal(activeWorkerR2[0]?.resourceKey, "file:src/worker.ts");
+    assert.ok((activeWorkerR2[0]?.salience ?? 0) >= 0.9, `Expected salience >= 0.90, got ${activeWorkerR2[0]?.salience}`);
+    assert.equal(activeWorkerR2[0]?.metadata.editedScope, true);
+
+    const supersededWorkerEdit = workerNodes.find((n) => n.resourceKey === "file:src/worker.ts#edit")!;
+    assert.equal(supersededWorkerEdit.status, "superseded");
+    assert.equal(supersededWorkerEdit.supersededBy, activeWorkerR2[0]?.id);
+
+    // Full write of src/chunks.ts MUST supersede BOTH disjoint #range=... nodes
+    const activeChunks = store
+      .listNodes(g.id, { status: "active" })
+      .filter((n) => n.metadata.fileScopeKey === "src/chunks.ts");
+    assert.equal(activeChunks.length, 1);
+    assert.equal(activeChunks[0]?.resourceKey, "file:src/chunks.ts");
+    assert.ok(activeChunks[0]?.content.includes("CHUNK_A = 10"));
+
+    store.close();
+  });
+});
+
+describe("v0.2 Compact Markdown Compiler & Priority Budget Engine", () => {
+  it("34. compiles compact_markdown strictly within maxOutputChars with 3-tier priority and zero XML/pruned noise", () => {
+    const store = new GraphStore(":memory:");
+    const g = store.createGraph({ id: "g_compact", name: "Compact Markdown Test" });
+
+    ingestToolArtifacts(store, g.id, [
+      // 3 unmodified read-only background noise files
+      {
+        callId: "bg1",
+        tool: "read_file",
+        args: { path: "src/docs-index.ts" },
+        ok: true,
+        output: "export const DOC_SECTION_1 = 'overview';\n".repeat(12),
+      },
+      {
+        callId: "bg2",
+        tool: "read_file",
+        args: { path: "src/formatting.ts" },
+        ok: true,
+        output: "export function padLeft(s: string) { return s.padStart(4); }\n".repeat(12),
+      },
+      {
+        callId: "bg3",
+        tool: "read_file",
+        args: { path: "src/cli-banner.ts" },
+        ok: true,
+        output: "export const BANNER_TITLE = 'console';\n".repeat(12),
+      },
+      // Active working edited file (base + partial edit)
+      {
+        callId: "wk_r",
+        tool: "read_file",
+        args: { path: "src/dispatcher.ts" },
+        ok: true,
+        output: [
+          "import { EventEmitter } from 'node:events';",
+          "export const RETRY_DELAY_MS = 450;",
+          "export const MAX_INFLIGHT = 32;",
+          "export function dispatchBatch(items: string[]): number {",
+          "  return items.length;",
+          "}",
+          "[pruned 999 chars; head/tail shown]",
+        ].join("\n"),
+      },
+      {
+        callId: "wk_e",
+        tool: "edit_file",
+        args: {
+          path: "src/dispatcher.ts",
+          old_text: "export const MAX_INFLIGHT = 32;",
+          new_text: "export const MAX_INFLIGHT = 64;",
+        },
+        ok: true,
+        output: "Edited src/dispatcher.ts",
+      },
+      // Active failing check with noisy node_modules frames
+      {
+        callId: "chk_f",
+        tool: "bash",
+        args: { command: "npm test" },
+        ok: false,
+        output: [
+          "FAIL src/dispatcher.test.ts > caps inflight batch",
+          "  Error [ERR_BATCH_OVERFLOW]: received 64 expected <= 32",
+          "    at dispatchBatch (src/dispatcher.ts:41:7)",
+          "    at runTask (node_modules/vitest/dist/runner.js:901:14)",
+          "    at processTicksAndRejections (node:internal/process/task_queues:95:5)",
+          "Tests  1 failed | 17 passed (18)",
+          "Command exited with code 1",
+        ].join("\n"),
+      },
+    ]);
+
+    const compiled = compileContext(store, {
+      graphId: g.id,
+      format: "compact_markdown",
+      maxOutputChars: 950,
+    });
+
+    const out = compiled.promptText;
+    assert.ok(out.length > 0 && out.length <= 950, `Expected 1..950 chars, got ${out.length}`);
+    assert.ok(!out.includes("<node "), "compact_markdown must emit zero XML tags");
+    assert.ok(!out.includes("<zone_1_"), "compact_markdown must emit zero XML tags");
+    assert.ok(!out.includes("[pruned"), "Must contain zero [pruned markers");
+    assert.ok(!out.includes("head/tail shown"), "Must contain zero head/tail markers");
+    assert.ok(!/\(v\d+,\s*read_file,\s*ok\)/i.test(out), "Must contain zero (vN, read_file, ok) phrasing");
+
+    // Tier 1 failing check preserves error code & app source frame without node_modules
+    assert.ok(out.includes("[check failed]"), `Expected [check failed] tier: ${out}`);
+    assert.ok(out.includes("ERR_BATCH_OVERFLOW"));
+    assert.ok(out.includes("src/dispatcher.ts:41:7"));
+    assert.ok(!out.includes("node_modules/"));
+
+    // Tier 2 preserves base snapshot BEFORE #edit delta, with full exported constants intact
+    const baseIdx = out.indexOf("`src/dispatcher.ts`:");
+    const editIdx = out.indexOf("[file edit] `src/dispatcher.ts`:");
+    assert.ok(baseIdx >= 0 && editIdx > baseIdx, `Base snapshot must precede #edit delta:\n${out}`);
+    assert.ok(out.includes("RETRY_DELAY_MS = 450"));
+    assert.ok(out.includes("MAX_INFLIGHT = 64"));
+
+    // Tier 3 collapses unmodified background files into a single compact line
+    assert.ok(out.includes("- [other read files]:"), `Expected collapsed other read files:\n${out}`);
+    assert.ok(out.includes("`src/docs-index.ts`"));
+    assert.ok(!out.includes("DOC_SECTION_1"), "Unmodified background file body must not bloat output");
+
+    // XML mode also benefits from unresolvedFailure priority utility boost
+    const xmlCompiled = compileContext(store, {
+      graphId: g.id,
+      format: "xml",
+      maxTokens: 320,
+      recordCacheState: false,
+    });
+    const failEntry = xmlCompiled.zone2Nodes.find((n) => n.resourceKey === "cmd:npm test");
+    assert.ok(failEntry, "Failing check must be selected in XML mode too");
+    assert.equal(failEntry?.lod, "full", "Failing check must reach full LOD instead of stub starvation");
+
+    store.close();
+  });
+
+  it("35. elevates failed-edit target files to Tier 2, supports read-only fallback, and preserves Zone 1 KV prefix", () => {
+    // Part A: Failed edit elevates target file scope to Tier 2 while collapsing unrelated reads
+    const storeA = new GraphStore(":memory:");
+    const gA = storeA.createGraph({ id: "g_failed_edit", name: "Failed Edit Target Elevation" });
+    ingestToolArtifacts(storeA, gA.id, [
+      {
+        callId: "r_target",
+        tool: "read_file",
+        args: { path: "src/throttle.ts" },
+        ok: true,
+        output: "export const WINDOW_SECONDS = 60;\nexport const MAX_REQUESTS = 120;\nexport function allowRequest() { return true; }",
+      },
+      {
+        callId: "e_fail",
+        tool: "edit_file",
+        args: { path: "src/throttle.ts", old_text: "nonexistent", new_text: "x" },
+        ok: false,
+        output: "Error: old_text did not match any lines in src/throttle.ts",
+      },
+      {
+        callId: "r_bg1",
+        tool: "read_file",
+        args: { path: "src/readme-note.ts" },
+        ok: true,
+        output: "export const NOTE_ALPHA = 'background noise';\n".repeat(10),
+      },
+      {
+        callId: "r_bg2",
+        tool: "read_file",
+        args: { path: "src/metrics-stub.ts" },
+        ok: true,
+        output: "export const METRIC_BETA = 'background noise';\n".repeat(10),
+      },
+    ]);
+
+    const resA = compileContext(storeA, {
+      graphId: gA.id,
+      format: "compact_markdown",
+      maxOutputChars: 950,
+    });
+    assert.ok(resA.promptText.length <= 950);
+    assert.ok(resA.promptText.includes("WINDOW_SECONDS = 60"), "Failed-edit target must get full declaration excerpt");
+    assert.ok(resA.promptText.includes("MAX_REQUESTS = 120"));
+    assert.ok(resA.promptText.includes("- [other read files]:"));
+    assert.ok(!resA.promptText.includes("NOTE_ALPHA"), "Background noise must stay collapsed");
+    storeA.close();
+
+    // Part B: Pure read-only trajectory (no Tier 1/Tier 2) gives full excerpts to read files + Zone 1 prefix caching
+    const storeB = new GraphStore(":memory:");
+    const gB = storeB.createGraph({ id: "g_readonly", name: "Read-Only Fallback" });
+    storeB.addNode(gB.id, {
+      id: "c_pin",
+      kind: "constraint",
+      tier: "pinned_prefix",
+      content: "Never disable TLS verification.",
+    });
+    ingestToolArtifacts(storeB, gB.id, [
+      {
+        callId: "ro1",
+        tool: "read_file",
+        args: { path: "src/settings.ts" },
+        ok: true,
+        output: "export const LISTEN_PORT = 8443;\nexport const TLS_REQUIRED = true;",
+      },
+    ]);
+
+    const c1 = compileContext(storeB, {
+      graphId: gB.id,
+      format: "compact_markdown",
+      maxOutputChars: 950,
+    });
+    assert.ok(c1.promptText.includes("Never disable TLS verification."));
+    assert.ok(c1.promptText.includes("LISTEN_PORT = 8443"));
+    assert.ok(c1.promptText.includes("TLS_REQUIRED = true"));
+    assert.ok(!c1.promptText.includes("[other read files]"), "Read-only trajectory should show full excerpts");
+
+    // Mutate Zone 2 -> Zone 1 prefix still hits KV cache!
+    ingestToolArtifacts(storeB, gB.id, [
+      {
+        callId: "ro2",
+        tool: "bash",
+        args: { command: "npm run lint" },
+        ok: true,
+        output: "0 errors",
+      },
+    ]);
+    const c2 = compileContext(storeB, {
+      graphId: gB.id,
+      format: "compact_markdown",
+      maxOutputChars: 950,
+    });
+    assert.ok(c2.kvCache.prefixCachedTokens > 0, "Zone 1 prefix should be cached in compact_markdown mode");
+    storeB.close();
+  });
+});
+
+describe("v0.2 HTTP /ingest-artifacts, Compile Formats & MCP Tool Annotations E2E", () => {
+  it("36. serves Bearer-guarded POST /v1/graphs/:id/ingest-artifacts and compact_markdown POST /compile", async () => {
+    const token = "cg_v2_artifact_engine_bearer_secret";
+    const app = createContextGraphServer({ dataPath: ":memory:", port: 0, authToken: token });
+    const bound = await app.start(0, "127.0.0.1");
+    const authHeaders = {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    };
+
+    try {
+      // Create graph
+      const createRes = await fetch(`${bound.url}/v1/graphs`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ id: "http_v2_g1", name: "v0.2 HTTP Artifact Graph" }),
+      });
+      assert.equal(createRes.status, 201);
+
+      const sampleEvents: ToolTrajectoryEvent[] = [
+        {
+          callId: "ev1",
+          tool: "read_file",
+          args: { path: "src/queue.ts" },
+          ok: true,
+          output: "export const QUEUE_CAP = 50;\nexport function enqueue(x: string) { return x; }",
+        },
+        {
+          callId: "ev2",
+          tool: "edit_file",
+          args: {
+            path: "src/queue.ts",
+            old_text: "export const QUEUE_CAP = 50;",
+            new_text: "export const QUEUE_CAP = 100;",
+          },
+          ok: true,
+          output: "Edited src/queue.ts",
+        },
+        {
+          callId: "ev3",
+          tool: "bash",
+          args: { command: "npm test" },
+          ok: false,
+          output: "FAIL src/queue.test.ts\nError [ERR_QUEUE_FULL]: limit 100\n  at enqueue (src/queue.ts:2:12)",
+        },
+      ];
+
+      // 401 without Bearer auth
+      const unauthRes = await fetch(`${bound.url}/v1/graphs/http_v2_g1/ingest-artifacts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ events: sampleEvents }),
+      });
+      assert.equal(unauthRes.status, 401);
+
+      // 400 when events is missing
+      const invalidRes = await fetch(`${bound.url}/v1/graphs/http_v2_g1/ingest-artifacts`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ prune: true }),
+      });
+      assert.equal(invalidRes.status, 400);
+
+      // 200 with valid Bearer auth + prune + compile
+      const okRes = await fetch(`${bound.url}/v1/graphs/http_v2_g1/ingest-artifacts`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          events: sampleEvents,
+          prune: true,
+          compile: true,
+          compileOptions: { format: "compact_markdown", maxOutputChars: 800 },
+        }),
+      });
+      assert.equal(okRes.status, 200);
+      const body = (await okRes.json()) as {
+        ok: boolean;
+        graphId: string;
+        ingested: { ingestedCount: number; unresolvedFailureNodeIds: string[] };
+        pruned: { prunedCount: number; events: unknown[] };
+        compiled: { promptText: string };
+      };
+      assert.equal(body.ok, true);
+      assert.equal(body.graphId, "http_v2_g1");
+      assert.equal(body.ingested.ingestedCount, 3);
+      assert.equal(body.ingested.unresolvedFailureNodeIds.length, 1);
+      assert.equal(body.pruned.events.length, 3);
+      assert.ok(body.compiled.promptText.length <= 800);
+      assert.ok(body.compiled.promptText.includes("ERR_QUEUE_FULL"));
+      assert.ok(body.compiled.promptText.includes("src/queue.ts:2:12"));
+      assert.ok(body.compiled.promptText.includes("QUEUE_CAP = 100"));
+
+      // Direct POST /v1/graphs/:id/compile supports format & maxOutputChars
+      const compileRes = await fetch(`${bound.url}/v1/graphs/http_v2_g1/compile`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ format: "compact_markdown", maxOutputChars: 500 }),
+      });
+      assert.equal(compileRes.status, 200);
+      const compBody = (await compileRes.json()) as { ok: boolean; promptText: string };
+      assert.equal(compBody.ok, true);
+      assert.ok(compBody.promptText.length <= 500);
+      assert.ok(!compBody.promptText.includes("<node "));
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("37. exposes cg_ingest_artifacts and annotations.readOnlyHint on every tool over /mcp", async () => {
+    const token = "cg_v2_mcp_annotations_secret_token";
+    const app = createContextGraphServer({ dataPath: ":memory:", port: 0, authToken: token });
+    const bound = await app.start(0, "127.0.0.1");
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    };
+
+    try {
+      const listRes = await fetch(`${bound.url}/mcp`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      });
+      assert.equal(listRes.status, 200);
+      const listBody = (await listRes.json()) as {
+        result: {
+          tools: Array<{ name: string; annotations?: { readOnlyHint?: boolean } }>;
+        };
+      };
+
+      const tools = listBody.result.tools;
+      assert.equal(tools.length, 7);
+      const byName = new Map(tools.map((t) => [t.name, t]));
+      assert.ok(byName.has("cg_ingest_artifacts"));
+
+      // Every tool must declare annotations.readOnlyHint accurately
+      assert.equal(byName.get("cg_create_graph")?.annotations?.readOnlyHint, false);
+      assert.equal(byName.get("cg_add_node")?.annotations?.readOnlyHint, false);
+      assert.equal(byName.get("cg_link_nodes")?.annotations?.readOnlyHint, false);
+      assert.equal(byName.get("cg_ingest_turn")?.annotations?.readOnlyHint, false);
+      assert.equal(byName.get("cg_ingest_artifacts")?.annotations?.readOnlyHint, false);
+      assert.equal(byName.get("cg_compile_context")?.annotations?.readOnlyHint, true);
+      assert.equal(byName.get("cg_export_mermaid")?.annotations?.readOnlyHint, true);
+
+      // End-to-end tools/call workflow with cg_ingest_artifacts + compact_markdown compile
+      const createRes = await fetch(`${bound.url}/mcp`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: { name: "cg_create_graph", arguments: { id: "mcp_v2_g1", name: "MCP v0.2" } },
+        }),
+      });
+      assert.equal(createRes.status, 200);
+
+      const ingestRes = await fetch(`${bound.url}/mcp`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 3,
+          method: "tools/call",
+          params: {
+            name: "cg_ingest_artifacts",
+            arguments: {
+              graphId: "mcp_v2_g1",
+              prune: true,
+              compile: true,
+              compileOptions: { format: "compact_markdown", maxOutputChars: 700 },
+              events: [
+                {
+                  callId: "m_r1",
+                  tool: "read_file",
+                  args: { path: "src/codec.ts" },
+                  ok: true,
+                  output: "export const CODEC_VERSION = 2;\nexport function encodeFrame(b: Uint8Array) { return b; }",
+                },
+                {
+                  callId: "m_t1",
+                  tool: "bash",
+                  args: { command: "npm test" },
+                  ok: false,
+                  output: "FAIL src/codec.test.ts\nError [ERR_FRAME_CRC]: checksum mismatch\n  at encodeFrame (src/codec.ts:2:15)",
+                },
+              ],
+            },
+          },
+        }),
+      });
+      assert.equal(ingestRes.status, 200);
+      const ingestBody = (await ingestRes.json()) as {
+        result: {
+          isError: boolean;
+          structuredContent: {
+            ok: boolean;
+            ingested: { ingestedCount: number };
+            compiled: { promptText: string };
+          };
+        };
+      };
+      assert.equal(ingestBody.result.isError, false);
+      assert.equal(ingestBody.result.structuredContent.ok, true);
+      assert.equal(ingestBody.result.structuredContent.ingested.ingestedCount, 2);
+      assert.ok(ingestBody.result.structuredContent.compiled.promptText.length <= 700);
+      assert.ok(ingestBody.result.structuredContent.compiled.promptText.includes("ERR_FRAME_CRC"));
+      assert.ok(ingestBody.result.structuredContent.compiled.promptText.includes("src/codec.ts:2:15"));
     } finally {
       await app.close();
     }

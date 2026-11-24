@@ -1,4 +1,5 @@
 import type { Readable, Writable } from "node:stream";
+import { ingestToolArtifacts, pruneTrajectoryEvents } from "./artifact-engine.ts";
 import { compileContext } from "./compiler.ts";
 import { GraphStore } from "./graph-store.ts";
 import {
@@ -9,7 +10,9 @@ import {
   type AddNodeInput,
   type CompileOptions,
   type CreateGraphInput,
+  type IngestArtifactsOptions,
   type IngestTurnInput,
+  type ToolTrajectoryEvent,
 } from "./types.ts";
 
 export const MCP_PROTOCOL_VERSION = "2024-11-05" as const;
@@ -42,6 +45,7 @@ export const MCP_TOOLS = [
     name: "cg_create_graph",
     description:
       "Create a new Two-Zone KV-Cache-Aware Context Graph workspace for an agent session or task.",
+    annotations: { readOnlyHint: false },
     inputSchema: {
       type: "object",
       properties: {
@@ -57,6 +61,7 @@ export const MCP_TOOLS = [
     name: "cg_add_node",
     description:
       "Add a typed node to a Context Graph. Automatically versions and links `supersedes` when `resourceKey` matches a prior active node.",
+    annotations: { readOnlyHint: false },
     inputSchema: {
       type: "object",
       properties: {
@@ -83,6 +88,7 @@ export const MCP_TOOLS = [
     name: "cg_link_nodes",
     description:
       "Create a directed typed edge (`depends_on`, `supersedes`, `summarizes`, `elaborates`, `scoped_to`, `conflicts_with`). Enforces strict DAG cycle rejection.",
+    annotations: { readOnlyHint: false },
     inputSchema: {
       type: "object",
       properties: {
@@ -99,6 +105,7 @@ export const MCP_TOOLS = [
     name: "cg_ingest_turn",
     description:
       "Ingest a full agent/user/tool turn (constraints, decisions, file artifacts, tool outputs, or dead-end scope retractions) in one atomic transaction.",
+    annotations: { readOnlyHint: false },
     inputSchema: {
       type: "object",
       properties: {
@@ -130,9 +137,47 @@ export const MCP_TOOLS = [
     },
   },
   {
+    name: "cg_ingest_artifacts",
+    description:
+      "Ingest structured tool-trajectory events (file reads, ranged reads, partial edits, full writes, commands, searches) with idempotent versioning, cross-compaction supersession cleanup, optional trajectory pruning, and optional compilation.",
+    annotations: { readOnlyHint: false },
+    inputSchema: {
+      type: "object",
+      properties: {
+        graphId: { type: "string" },
+        events: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              callId: { type: "string" },
+              tool: { type: "string" },
+              args: { type: "object" },
+              ok: { type: "boolean" },
+              output: { type: "string" },
+              seq: { type: "integer" },
+              turn: { type: "integer" },
+              machineId: { type: "string" },
+              scope: { type: "string" },
+            },
+            required: ["callId", "tool", "ok", "output"],
+          },
+        },
+        scope: { type: "string" },
+        turn: { type: "integer" },
+        machineId: { type: "string" },
+        prune: { type: "boolean" },
+        compile: { type: "boolean" },
+        compileOptions: { type: "object" },
+      },
+      required: ["graphId", "events"],
+    },
+  },
+  {
     name: "cg_compile_context",
     description:
-      "Compile the Context Graph into a Two-Zone KV-Cache-friendly prompt & OpenAI messages[] within token budget, reporting exact Prefix KV-Cache hit rate.",
+      "Compile the Context Graph into a Two-Zone KV-Cache-friendly XML or compact_markdown prompt & OpenAI messages[] within budget, reporting exact Prefix KV-Cache hit rate.",
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: "object",
       properties: {
@@ -141,7 +186,14 @@ export const MCP_TOOLS = [
         focusNodeIds: { type: "array", items: { type: "string" } },
         activeScope: { type: "string" },
         maxTokens: { type: "integer" },
-        format: { type: "string", enum: ["both", "messages", "prompt"] },
+        format: {
+          type: "string",
+          enum: ["both", "messages", "prompt", "xml", "compact_markdown"],
+        },
+        maxOutputChars: {
+          type: "integer",
+          description: "Maximum output character budget for compact_markdown format (default: 950, max: 4000).",
+        },
       },
       required: ["graphId"],
     },
@@ -150,6 +202,7 @@ export const MCP_TOOLS = [
     name: "cg_export_mermaid",
     description:
       "Export the Two-Zone Property DAG topology as a GitHub-flavored Mermaid flowchart.",
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: "object",
       properties: {
@@ -327,6 +380,38 @@ export class ContextGraphMcpSession {
         const { graphId: _ignored, ...rest } = args;
         const res = this.store.ingestTurn(graphId, rest as unknown as IngestTurnInput);
         return { ok: true, ...res };
+      }
+      case "cg_ingest_artifacts": {
+        const graphId = String(args.graphId ?? "");
+        if (!Array.isArray(args.events)) {
+          throw new ContextGraphError("'events' array is required", "VALIDATION_ERROR", 400);
+        }
+        const events = args.events as ToolTrajectoryEvent[];
+        const ingestOpts: IngestArtifactsOptions = {
+          ...(typeof args.scope === "string" ? { scope: args.scope } : {}),
+          ...(typeof args.turn === "number" ? { turn: args.turn } : {}),
+          ...(typeof args.machineId === "string" ? { machineId: args.machineId } : {}),
+        };
+        const ingested = ingestToolArtifacts(this.store, graphId, events, ingestOpts);
+        const pruned = args.prune === true ? pruneTrajectoryEvents(events) : undefined;
+        const compiled =
+          args.compile === true
+            ? compileContext(this.store, {
+                ...(args.compileOptions &&
+                typeof args.compileOptions === "object" &&
+                !Array.isArray(args.compileOptions)
+                  ? (args.compileOptions as Omit<CompileOptions, "graphId">)
+                  : {}),
+                graphId,
+              })
+            : undefined;
+        return {
+          ok: true,
+          graphId,
+          ingested,
+          ...(pruned ? { pruned } : {}),
+          ...(compiled ? { compiled } : {}),
+        };
       }
       case "cg_compile_context": {
         const graphId = String(args.graphId ?? "");

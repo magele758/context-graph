@@ -1,3 +1,9 @@
+import {
+  compactCodeExcerpt,
+  compactCommandExcerpt,
+  sanitizeNeutralText,
+  truncateAtWordBoundary,
+} from "./excerpt.ts";
 import type { GraphStore } from "./graph-store.ts";
 import type {
   AgentLoopCompatibleMessage,
@@ -95,6 +101,732 @@ function lexicalResourceBoost(query: string, node: GraphNode): number {
   if (qLower.includes(rawKey)) return 0.5;
   if (baseName.length >= 3 && qLower.includes(baseName)) return 0.42;
   return 0;
+}
+
+const DEFAULT_COMPACT_MAX_CHARS = 950 as const;
+const MAX_COMPACT_OUTPUT_CHARS = 4000 as const;
+const STALE_META_TAG_RE = /\s*\(v\d+,\s*[^,)]+,\s*(?:ok|err|error|failed)\)/gi;
+
+function getFileScopeKey(node: GraphNode): string | null {
+  if (typeof node.metadata.fileScopeKey === "string" && node.metadata.fileScopeKey.trim()) {
+    return node.metadata.fileScopeKey.trim();
+  }
+  if (node.resourceKey?.startsWith("file:")) {
+    return node.resourceKey.slice("file:".length).replace(/#(?:edit|range=.*)$/, "");
+  }
+  if (node.resourceKey?.startsWith("file_err:")) {
+    return node.resourceKey.slice("file_err:".length);
+  }
+  return null;
+}
+
+function getFileDisplayPath(node: GraphNode): string {
+  if (typeof node.metadata.path === "string" && node.metadata.path.trim()) {
+    return node.metadata.path.trim();
+  }
+  const scopeKey = getFileScopeKey(node);
+  if (scopeKey) return scopeKey;
+  return node.resourceKey ?? node.id;
+}
+
+function isFileArtifactNode(node: GraphNode): boolean {
+  if (node.metadata.artifactFamily === "file") return true;
+  return node.kind === "artifact" && Boolean(node.resourceKey?.startsWith("file:"));
+}
+
+function isFileErrorNode(node: GraphNode): boolean {
+  return (
+    node.metadata.artifactFamily === "file_error" ||
+    Boolean(node.resourceKey?.startsWith("file_err:"))
+  );
+}
+
+function isCommandNode(node: GraphNode): boolean {
+  return (
+    node.metadata.artifactFamily === "command" ||
+    Boolean(node.resourceKey?.startsWith("cmd:"))
+  );
+}
+
+function cleanCompactFragment(text: string): string {
+  return sanitizeNeutralText(text).replace(STALE_META_TAG_RE, "").trim();
+}
+
+function flattenCodeLines(text: string): string {
+  const lines = cleanCompactFragment(text)
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+  if (lines.length === 0) return "";
+  let out = lines[0]!;
+  for (let i = 1; i < lines.length; i++) {
+    const prev = lines[i - 1]!;
+    const curr = lines[i]!;
+    const prevIsComment = /^(?:\/\/|#|\/\*|--)/.test(prev);
+    const isDiffLine = /^[+-]\s/.test(prev) || /^[+-]\s/.test(curr);
+    if (prevIsComment || isDiffLine) {
+      out += ` | ${curr}`;
+    } else if (/[;{,:]$/.test(prev)) {
+      out += ` ${curr}`;
+    } else {
+      out += `; ${curr}`;
+    }
+  }
+  return out;
+}
+
+function flattenCommandLines(text: string): string {
+  return cleanCompactFragment(text)
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0)
+    .join(" | ");
+}
+
+function allocateWaterFilling(desired: readonly number[], totalBudget: number): number[] {
+  const n = desired.length;
+  if (n === 0 || totalBudget <= 0) return desired.map(() => 0);
+  const sum = desired.reduce((a, b) => a + b, 0);
+  if (sum <= totalBudget) {
+    return [...desired];
+  }
+
+  const alloc = new Array<number>(n).fill(0);
+  const active = new Set<number>();
+  for (let i = 0; i < n; i++) active.add(i);
+  let rem = totalBudget;
+
+  while (active.size > 0 && rem > 0) {
+    const share = Math.floor(rem / active.size);
+    if (share <= 0) break;
+    let saturatedAny = false;
+    for (const idx of Array.from(active)) {
+      if (desired[idx]! <= alloc[idx]! + share) {
+        const give = desired[idx]! - alloc[idx]!;
+        alloc[idx] = desired[idx]!;
+        rem -= give;
+        active.delete(idx);
+        saturatedAny = true;
+      }
+    }
+    if (!saturatedAny) {
+      for (const idx of active) {
+        alloc[idx] = alloc[idx]! + share;
+        rem -= share;
+      }
+      break;
+    }
+  }
+  return alloc;
+}
+
+interface CompactMarkdownBuildArgs {
+  store: GraphStore;
+  graph: ReturnType<GraphStore["getGraph"]>;
+  options: CompileOptions;
+  focusQuery: string;
+  activeScope: string;
+  maxTokens: number;
+  zone1MaxRatio: number;
+  nodes: readonly GraphNode[];
+  activeNodes: readonly GraphNode[];
+  zone1Candidates: readonly GraphNode[];
+  zone2Candidates: readonly GraphNode[];
+  excludedNodes: ExcludedNodeEntry[];
+  activeConflictEdges: readonly GraphEdge[];
+  pprScoreById: ReadonlyMap<string, number>;
+  utilityOf: (n: GraphNode) => number;
+  isPriorityFileNode: (n: GraphNode) => boolean;
+  supersededOccluded: number;
+  retractedPruned: number;
+  fullLinearTokens: number;
+}
+
+function compileCompactMarkdown(args: CompactMarkdownBuildArgs): CompileResult {
+  const {
+    store,
+    graph,
+    options,
+    focusQuery,
+    activeScope,
+    maxTokens,
+    zone1MaxRatio,
+    nodes,
+    activeNodes,
+    zone1Candidates,
+    zone2Candidates,
+    excludedNodes,
+    activeConflictEdges,
+    pprScoreById,
+    utilityOf,
+    isPriorityFileNode,
+    supersededOccluded,
+    retractedPruned,
+    fullLinearTokens,
+  } = args;
+
+  const maxOutputChars =
+    typeof options.maxOutputChars === "number" &&
+    Number.isFinite(options.maxOutputChars) &&
+    options.maxOutputChars >= 80
+      ? Math.min(MAX_COMPACT_OUTPUT_CHARS, Math.floor(options.maxOutputChars))
+      : DEFAULT_COMPACT_MAX_CHARS;
+
+  const lodCounts: Record<LodLevel, number> = { full: 0, summary: 0, stub: 0 };
+
+  // 1. Zone 1: Deterministic pinned_prefix / stable_frame lines sorted by seq ASC
+  const zone1Entries: CompiledNodeEntry[] = [];
+  const zone1CharCap =
+    zone2Candidates.length > 0
+      ? Math.floor(maxOutputChars * zone1MaxRatio)
+      : maxOutputChars;
+  let zone1UsedChars = 0;
+
+  for (const n of zone1Candidates) {
+    const prefix = `- [${n.kind}]: `;
+    const sep = zone1Entries.length > 0 ? 1 : 0;
+    const rem = zone1CharCap - zone1UsedChars - sep;
+    if (rem <= prefix.length + 12) break;
+    const body = cleanCompactFragment(n.content).replace(/\s*\n+\s*/g, " ");
+    const fitted = truncateAtWordBoundary(body, rem - prefix.length);
+    const line = `${prefix}${fitted}`;
+    const lod: LodLevel = fitted.length >= body.length ? "full" : "summary";
+    lodCounts[lod]++;
+    zone1UsedChars += sep + line.length;
+    zone1Entries.push({
+      id: n.id,
+      seq: n.seq,
+      turn: n.turn,
+      kind: n.kind,
+      role: n.role,
+      tier: n.tier,
+      scope: n.scope,
+      zone: 1,
+      lod,
+      version: n.version,
+      resourceKey: n.resourceKey,
+      tokens: countTokens(line),
+      activationScore: pprScoreById.get(n.id) ?? 0,
+      renderedText: line,
+      pulledByClosure: false,
+    });
+  }
+
+  // 2. Partition Zone 2 active nodes into strict 3-tier engineering priority
+  const tier1Nodes: GraphNode[] = [];
+  const tier2RawNodes: GraphNode[] = [];
+  let unmodifiedReadFiles: GraphNode[] = [];
+  const passingChecks: GraphNode[] = [];
+  const otherTier3Nodes: GraphNode[] = [];
+
+  for (const n of zone2Candidates) {
+    if (n.metadata.unresolvedFailure === true) {
+      tier1Nodes.push(n);
+    } else if (isFileErrorNode(n) || isPriorityFileNode(n) || n.kind === "decision") {
+      tier2RawNodes.push(n);
+    } else if (isFileArtifactNode(n)) {
+      unmodifiedReadFiles.push(n);
+    } else if (isCommandNode(n)) {
+      passingChecks.push(n);
+    } else {
+      otherTier3Nodes.push(n);
+    }
+  }
+
+  tier1Nodes.sort((a, b) => {
+    const diff = utilityOf(b) - utilityOf(a);
+    return Math.abs(diff) > 1e-12 ? diff : a.seq - b.seq;
+  });
+
+  unmodifiedReadFiles.sort((a, b) => {
+    const diff = utilityOf(b) - utilityOf(a);
+    return Math.abs(diff) > 1e-12 ? diff : a.seq - b.seq;
+  });
+
+  passingChecks.sort((a, b) => b.seq - a.seq);
+  otherTier3Nodes.sort((a, b) => {
+    const diff = utilityOf(b) - utilityOf(a);
+    return Math.abs(diff) > 1e-12 ? diff : a.seq - b.seq;
+  });
+
+  // Read-only trajectory fallback: if there are NO Tier 1 / Tier 2 items, promote
+  // active read-only files to Tier 2 so they get full declaration-aware excerpts.
+  const promotedReadOnly = tier1Nodes.length === 0 && tier2RawNodes.length === 0 && unmodifiedReadFiles.length > 0;
+  if (promotedReadOnly) {
+    tier2RawNodes.push(...unmodifiedReadFiles);
+    unmodifiedReadFiles = [];
+  }
+
+  // Group Tier 2 file & file_error nodes by fileScopeKey so base snapshot ALWAYS precedes #edit delta / file_error
+  const fileNodeSubOrder = (n: GraphNode): number => {
+    if (isFileErrorNode(n)) return 3;
+    const op = n.metadata.fileOpKind;
+    if (op === "partial_edit" || n.resourceKey?.endsWith("#edit")) return 2;
+    if (op === "ranged_read" || n.resourceKey?.includes("#range=")) return 1;
+    return 0;
+  };
+
+  interface Tier2Group {
+    maxUtility: number;
+    minSeq: number;
+    nodes: GraphNode[];
+  }
+  const groupMap = new Map<string, Tier2Group>();
+  const tier2Groups: Tier2Group[] = [];
+
+  for (const n of tier2RawNodes) {
+    const scopeKey = isFileArtifactNode(n) || isFileErrorNode(n) ? getFileScopeKey(n) : null;
+    if (scopeKey) {
+      let grp = groupMap.get(scopeKey);
+      if (!grp) {
+        grp = { maxUtility: utilityOf(n), minSeq: n.seq, nodes: [] };
+        groupMap.set(scopeKey, grp);
+        tier2Groups.push(grp);
+      } else {
+        grp.maxUtility = Math.max(grp.maxUtility, utilityOf(n));
+        grp.minSeq = Math.min(grp.minSeq, n.seq);
+      }
+      grp.nodes.push(n);
+    } else {
+      tier2Groups.push({ maxUtility: utilityOf(n), minSeq: n.seq, nodes: [n] });
+    }
+  }
+
+  for (const grp of tier2Groups) {
+    grp.nodes.sort((a, b) => {
+      const subDiff = fileNodeSubOrder(a) - fileNodeSubOrder(b);
+      if (subDiff !== 0) return subDiff;
+      return a.seq - b.seq;
+    });
+  }
+  tier2Groups.sort((a, b) => {
+    const diff = b.maxUtility - a.maxUtility;
+    return Math.abs(diff) > 1e-12 ? diff : a.minSeq - b.minSeq;
+  });
+
+  const tier2Nodes: GraphNode[] = [];
+  for (const grp of tier2Groups) {
+    tier2Nodes.push(...grp.nodes);
+  }
+
+  interface RenderedZone2Line {
+    tierRank: 1 | 2 | 3;
+    text: string;
+    nodes: GraphNode[];
+    lod: LodLevel;
+  }
+
+  const zone2Lines: RenderedZone2Line[] = [];
+  const includedNodeIds = new Set<string>(zone1Entries.map((e) => e.id));
+
+  let remainingChars =
+    maxOutputChars - zone1UsedChars - (zone1Entries.length > 0 ? 1 : 0);
+
+  const pushZone2Line = (item: RenderedZone2Line): boolean => {
+    const sep = zone2Lines.length > 0 ? 1 : 0;
+    if (item.text.length + sep > remainingChars) return false;
+    zone2Lines.push(item);
+    remainingChars -= item.text.length + sep;
+    for (const n of item.nodes) includedNodeIds.add(n.id);
+    return true;
+  };
+
+  // --- Tier 1: Unresolved Failing Checks ---
+  if (tier1Nodes.length > 0 && remainingChars >= 40) {
+    const tier1CapTotal =
+      tier2Nodes.length > 0
+        ? Math.min(remainingChars, Math.max(360, Math.floor(remainingChars * 0.45)))
+        : remainingChars;
+    const tier1Prefixes = tier1Nodes.map((n) => {
+      const cmd =
+        typeof n.metadata.command === "string" && n.metadata.command.trim()
+          ? n.metadata.command.trim()
+          : (n.resourceKey?.replace(/^cmd:/, "") ?? n.id);
+      return `- [check failed] \`${cmd}\`: `;
+    });
+    const tier1Desired = tier1Nodes.map((n, i) => {
+      const ex = flattenCommandLines(compactCommandExcerpt(n.content, false, 314));
+      return tier1Prefixes[i]!.length + Math.min(320, ex.length);
+    });
+    const sepOverhead = Math.max(0, tier1Nodes.length - 1);
+    const tier1Allocs = allocateWaterFilling(
+      tier1Desired,
+      Math.max(0, tier1CapTotal - sepOverhead),
+    );
+
+    for (let i = 0; i < tier1Nodes.length; i++) {
+      const n = tier1Nodes[i]!;
+      const prefix = tier1Prefixes[i]!;
+      const alloc = tier1Allocs[i]!;
+      const sep = zone2Lines.length > 0 ? 1 : 0;
+      const budget = Math.min(alloc, remainingChars - sep);
+      if (budget <= prefix.length + 12) continue;
+      const exBudget = budget - prefix.length;
+      const cmdBudget = exBudget > 48 ? exBudget - 6 : exBudget;
+      const rawEx = compactCommandExcerpt(n.content, false, cmdBudget);
+      const flat = truncateAtWordBoundary(flattenCommandLines(rawEx), exBudget);
+      if (!flat) continue;
+      const line = `${prefix}${flat}`;
+      pushZone2Line({ tierRank: 1, text: line, nodes: [n], lod: "full" });
+    }
+  }
+
+  // Pre-build optional compact `[other read files]` line to estimate tiny reserve
+  const buildOtherReadFilesLine = (maxLen: number): { line: string; included: GraphNode[] } | null => {
+    if (unmodifiedReadFiles.length === 0 || maxLen < 32) return null;
+    const prefix = "- [other read files]: ";
+    if (maxLen <= prefix.length + 4) return null;
+    const seenPaths = new Set<string>();
+    const pickedParts: string[] = [];
+    const included: GraphNode[] = [];
+    let len = prefix.length;
+
+    for (const n of unmodifiedReadFiles) {
+      const p = getFileDisplayPath(n);
+      if (seenPaths.has(p)) {
+        included.push(n);
+        continue;
+      }
+      const token = `\`${p}\``;
+      const addLen = (pickedParts.length > 0 ? 2 : 0) + token.length;
+      if (len + addLen <= maxLen) {
+        seenPaths.add(p);
+        pickedParts.push(token);
+        included.push(n);
+        len += addLen;
+      } else {
+        break;
+      }
+    }
+    if (pickedParts.length === 0) return null;
+    return { line: `${prefix}${pickedParts.join(", ")}`, included };
+  };
+
+  // --- Tier 2: Edited scopes, #edit deltas, ranged chunks, failed-edit target files, decisions ---
+  if (tier2Nodes.length > 0 && remainingChars >= 36) {
+    const previewOther = buildOtherReadFilesLine(140);
+    const otherReserve =
+      previewOther && remainingChars - (previewOther.line.length + 1) >= tier2Nodes.length * 160
+        ? previewOther.line.length + 1
+        : 0;
+    const tier2BudgetPool = Math.max(0, remainingChars - otherReserve);
+
+    const buildTier2Prefix = (n: GraphNode): string => {
+      if (n.kind === "decision") return "- [decision]: ";
+      const pathLabel = getFileDisplayPath(n);
+      if (isFileErrorNode(n)) return `- [edit failed] \`${pathLabel}\`: `;
+      const op = n.metadata.fileOpKind;
+      if (op === "partial_edit" || n.resourceKey?.endsWith("#edit")) {
+        return `- [file edit] \`${pathLabel}\`: `;
+      }
+      if (op === "ranged_read" || n.resourceKey?.includes("#range=")) {
+        const rangeLabel =
+          typeof n.metadata.rangeLabel === "string" && n.metadata.rangeLabel
+            ? n.metadata.rangeLabel
+            : (n.resourceKey?.split("#range=")[1] ?? "range");
+        return `- [file] \`${pathLabel} (${rangeLabel})\`: `;
+      }
+      if (n.metadata.editedScope === true || op === "full_write" || op === "delete") {
+        return `- [file edited] \`${pathLabel}\`: `;
+      }
+      return `- [file] \`${pathLabel}\`: `;
+    };
+
+    const renderTier2Body = (n: GraphNode, cap: number): string => {
+      if (isFileErrorNode(n)) {
+        return truncateAtWordBoundary(
+          flattenCommandLines(compactCommandExcerpt(n.content, false, Math.min(cap, 180))),
+          cap,
+        );
+      }
+      if (n.kind === "decision") {
+        return truncateAtWordBoundary(
+          cleanCompactFragment(n.content).replace(/\s*\n+\s*/g, " "),
+          cap,
+        );
+      }
+      const codeEx = compactCodeExcerpt(n.content, cap);
+      return truncateAtWordBoundary(flattenCodeLines(codeEx), cap);
+    };
+
+    const tier2Prefixes = tier2Nodes.map((n) => buildTier2Prefix(n));
+    const tier2Desired = tier2Nodes.map((n, i) => {
+      const cap = isFileErrorNode(n) ? 160 : 340;
+      const body = renderTier2Body(n, cap);
+      return tier2Prefixes[i]!.length + body.length;
+    });
+
+    const sepOverhead =
+      (zone2Lines.length > 0 ? 1 : 0) + Math.max(0, tier2Nodes.length - 1);
+    const tier2Allocs = allocateWaterFilling(
+      tier2Desired,
+      Math.max(0, tier2BudgetPool - sepOverhead),
+    );
+
+    for (let i = 0; i < tier2Nodes.length; i++) {
+      const n = tier2Nodes[i]!;
+      const prefix = tier2Prefixes[i]!;
+      const sep = zone2Lines.length > 0 ? 1 : 0;
+      const budget = Math.min(tier2Allocs[i]!, remainingChars - sep);
+      if (budget <= prefix.length + 10) continue;
+      const exBudget = budget - prefix.length;
+      const body = renderTier2Body(n, exBudget);
+      if (!body) continue;
+      const line = `${prefix}${body}`;
+      pushZone2Line({
+        tierRank: 2,
+        text: line,
+        nodes: [n],
+        lod: body.length >= cleanCompactFragment(n.content).length ? "full" : "summary",
+      });
+    }
+  }
+
+  // --- Tier 3: Collapsed unmodified read-only files, passing checks, other low-priority items ---
+  if (unmodifiedReadFiles.length > 0 && remainingChars >= 36) {
+    const sep = zone2Lines.length > 0 ? 1 : 0;
+    const otherBuilt = buildOtherReadFilesLine(Math.min(180, remainingChars - sep));
+    if (otherBuilt) {
+      pushZone2Line({
+        tierRank: 3,
+        text: otherBuilt.line,
+        nodes: otherBuilt.included,
+        lod: "stub",
+      });
+    }
+  }
+
+  for (const n of passingChecks) {
+    const sep = zone2Lines.length > 0 ? 1 : 0;
+    if (remainingChars - sep < 44) break;
+    const cmd =
+      typeof n.metadata.command === "string" && n.metadata.command.trim()
+        ? n.metadata.command.trim()
+        : (n.resourceKey?.replace(/^cmd:/, "") ?? n.id);
+    const prefix = `- [check ok] \`${cmd}\`: `;
+    const exCap = Math.min(90, remainingChars - sep - prefix.length);
+    if (exCap < 10) break;
+    const ex = truncateAtWordBoundary(
+      flattenCommandLines(compactCommandExcerpt(n.content, true, exCap)),
+      exCap,
+    );
+    if (!ex) continue;
+    pushZone2Line({ tierRank: 3, text: `${prefix}${ex}`, nodes: [n], lod: "summary" });
+  }
+
+  for (const n of otherTier3Nodes) {
+    // Skip low-priority search results when budget is tight
+    if (n.metadata.artifactFamily === "search" && remainingChars < 220) continue;
+    const sep = zone2Lines.length > 0 ? 1 : 0;
+    if (remainingChars - sep < 44) break;
+    const prefix = `- [${n.kind}]: `;
+    const exCap = Math.min(180, remainingChars - sep - prefix.length);
+    if (exCap < 12) break;
+    const body = truncateAtWordBoundary(
+      cleanCompactFragment(n.content).replace(/\s*\n+\s*/g, " "),
+      exCap,
+    );
+    if (!body) continue;
+    pushZone2Line({ tierRank: 3, text: `${prefix}${body}`, nodes: [n], lod: "summary" });
+  }
+
+  // Conflict warnings (compact markdown line if room)
+  const nodeMap = new Map(activeNodes.map((n) => [n.id, n]));
+  const conflicts: ConflictWarning[] = activeConflictEdges.map((ce) => {
+    const sNode = nodeMap.get(ce.sourceId)!;
+    const tNode = nodeMap.get(ce.targetId)!;
+    return {
+      edgeId: ce.id,
+      sourceNodeId: sNode.id,
+      targetNodeId: tNode.id,
+      sourceExcerpt: sNode.summary.slice(0, 100),
+      targetExcerpt: tNode.summary.slice(0, 100),
+      includedInContext: includedNodeIds.has(sNode.id) || includedNodeIds.has(tNode.id),
+    };
+  });
+
+  const activeConflicts = conflicts.filter((c) => c.includedInContext);
+  if (activeConflicts.length > 0 && remainingChars >= 40) {
+    const sep = zone2Lines.length > 0 ? 1 : 0;
+    const alertLine = truncateAtWordBoundary(
+      `- [conflict]: ${activeConflicts.map((c) => `${c.sourceNodeId} <-> ${c.targetNodeId}`).join("; ")}`,
+      remainingChars - sep,
+    );
+    if (alertLine.length + sep <= remainingChars) {
+      zone2Lines.push({ tierRank: 3, text: alertLine, nodes: [], lod: "summary" });
+      remainingChars -= alertLine.length + sep;
+    }
+  }
+
+  // Assemble text and strictly enforce both `maxOutputChars` and `maxTokens`
+  const buildPromptText = () => {
+    const z1 = zone1Entries.map((e) => e.renderedText).join("\n");
+    const z2 = zone2Lines.map((l) => l.text).join("\n");
+    if (z1 && z2) return `${z1}\n${z2}`;
+    return z1 || z2;
+  };
+
+  let finalPromptText = buildPromptText();
+  let tokenIds = tokenizeToIds(finalPromptText);
+
+  while (
+    (finalPromptText.length > maxOutputChars || tokenIds.length > maxTokens) &&
+    zone2Lines.length > 0
+  ) {
+    // Drop lowest-priority (highest tierRank) line from the tail first
+    let dropIdx = -1;
+    let worstRank = -1;
+    for (let i = zone2Lines.length - 1; i >= 0; i--) {
+      if (zone2Lines[i]!.tierRank > worstRank) {
+        worstRank = zone2Lines[i]!.tierRank;
+        dropIdx = i;
+      }
+    }
+    if (dropIdx < 0) break;
+    if (zone2Lines.length === 1 && finalPromptText.length > maxOutputChars) {
+      const targetLen = Math.max(0, maxOutputChars - zone1UsedChars - (zone1Entries.length > 0 ? 1 : 0));
+      zone2Lines[0] = {
+        ...zone2Lines[0]!,
+        text: truncateAtWordBoundary(zone2Lines[0]!.text, targetLen),
+      };
+      finalPromptText = buildPromptText();
+      tokenIds = tokenizeToIds(finalPromptText);
+      break;
+    }
+    const removed = zone2Lines.splice(dropIdx, 1)[0]!;
+    for (const rn of removed.nodes) includedNodeIds.delete(rn.id);
+    finalPromptText = buildPromptText();
+    tokenIds = tokenizeToIds(finalPromptText);
+  }
+
+  if (finalPromptText.length > maxOutputChars) {
+    finalPromptText = truncateAtWordBoundary(finalPromptText, maxOutputChars);
+    tokenIds = tokenizeToIds(finalPromptText);
+  }
+
+  // Final cleanliness pass guaranteeing zero pruned/head-tail markers
+  finalPromptText = cleanCompactFragment(finalPromptText);
+  if (finalPromptText.length > maxOutputChars) {
+    finalPromptText = truncateAtWordBoundary(finalPromptText, maxOutputChars);
+  }
+  tokenIds = tokenizeToIds(finalPromptText);
+
+  // Build Zone 2 CompiledNodeEntry list and record budget-pruned exclusions
+  const zone2Entries: CompiledNodeEntry[] = [];
+  for (const line of zone2Lines) {
+    for (const n of line.nodes) {
+      lodCounts[line.lod]++;
+      zone2Entries.push({
+        id: n.id,
+        seq: n.seq,
+        turn: n.turn,
+        kind: n.kind,
+        role: n.role,
+        tier: n.tier,
+        scope: n.scope,
+        zone: 2,
+        lod: line.lod,
+        version: n.version,
+        resourceKey: n.resourceKey,
+        tokens: countTokens(line.text),
+        activationScore: pprScoreById.get(n.id) ?? 0,
+        renderedText: line.text,
+        pulledByClosure: false,
+      });
+    }
+  }
+
+  for (const cand of zone2Candidates) {
+    if (!includedNodeIds.has(cand.id)) {
+      excludedNodes.push({
+        id: cand.id,
+        kind: cand.kind,
+        resourceKey: cand.resourceKey,
+        version: cand.version,
+        reason: "budget_pruned",
+        tokensSaved: cand.tokens,
+      });
+    }
+  }
+
+  const zone1Text = zone1Entries.map((e) => e.renderedText).join("\n");
+  const zone2Text = zone2Lines.map((l) => l.text).join("\n");
+
+  const messages: ChatMessage[] = [];
+  if (zone1Text) {
+    messages.push({ role: "system", name: "zone_1_stable_prefix", content: zone1Text });
+  }
+  if (zone2Text) {
+    messages.push({ role: "user", name: "zone_2_working_subgraph", content: zone2Text });
+  }
+
+  const agentLoopMessages: AgentLoopCompatibleMessage[] = [
+    ...zone1Entries,
+    ...zone2Entries,
+  ].map((entry) => ({
+    id: entry.id,
+    sessionId: graph.id,
+    role: entry.role,
+    parts: [{ type: "text", text: entry.renderedText }],
+    seq: entry.seq,
+    ...(entry.resourceKey ? { key: entry.resourceKey } : {}),
+    lod: entry.lod,
+    zone: entry.zone,
+  }));
+
+  const prevTokenIds = options.previousTokenIds ?? graph.lastCompiledTokenIds;
+  const prefixCachedTokens =
+    prevTokenIds.length > 0 ? longestCommonPrefixLength(prevTokenIds, tokenIds) : 0;
+  const totalTokens = tokenIds.length;
+  const uncachedTokens = totalTokens - prefixCachedTokens;
+  const prefixHitRate =
+    prevTokenIds.length > 0 && totalTokens > 0 ? prefixCachedTokens / totalTokens : 0;
+  const effectiveBillableTokens =
+    Math.round((prefixCachedTokens * CACHED_TOKEN_COST_WEIGHT + uncachedTokens * 1.0) * 100) / 100;
+
+  const actualZone1Tokens = countTokens(zone1Text);
+  const actualZone2Tokens = countTokens(zone2Text);
+  const framingTokens = Math.max(0, totalTokens - actualZone1Tokens - actualZone2Tokens);
+
+  if (options.recordCacheState !== false && options.previousTokenIds === undefined) {
+    store.saveCompiledTokens(graph.id, tokenIds);
+  }
+
+  return {
+    graphId: graph.id,
+    focusQuery,
+    activeScope,
+    maxTokens,
+    messages,
+    promptText: finalPromptText,
+    agentLoopMessages,
+    tokenIds,
+    zone1Nodes: zone1Entries,
+    zone2Nodes: zone2Entries,
+    excludedNodes,
+    conflicts,
+    kvCache: {
+      totalTokens,
+      zone1Tokens: actualZone1Tokens,
+      zone2Tokens: actualZone2Tokens,
+      framingTokens,
+      prefixCachedTokens,
+      uncachedTokens,
+      prefixHitRate: Math.round(prefixHitRate * 10000) / 10000,
+      cachedCostDiscount: CACHED_TOKEN_COST_WEIGHT,
+      effectiveBillableTokens,
+    },
+    diagnostics: {
+      totalGraphNodes: nodes.length,
+      activeCandidates: activeNodes.length,
+      supersededOccluded,
+      retractedPruned,
+      closureAdditions: 0,
+      lodCounts,
+      compressionRatioVsFullLinear:
+        fullLinearTokens > 0 ? Math.round((totalTokens / fullLinearTokens) * 10000) / 10000 : 1,
+    },
+  };
 }
 
 export function compileContext(store: GraphStore, options: CompileOptions): CompileResult {
@@ -247,6 +979,9 @@ export function compileContext(store: GraphStore, options: CompileOptions): Comp
     if (node.turn === maxTurn && node.role === "user" && node.tier !== "pinned_prefix") {
       s += 0.95;
     }
+    if (node.metadata.unresolvedFailure === true) {
+      s += 0.65;
+    }
     if (focusSet.has(node.id)) {
       s += 1.25;
     }
@@ -359,11 +1094,68 @@ export function compileContext(store: GraphStore, options: CompileOptions): Comp
     return closure;
   };
 
+  const editedFileScopes = new Set<string>();
+  const errorTargetFileScopes = new Set<string>();
+  for (const n of activeNodes) {
+    const scopeKey = getFileScopeKey(n);
+    if (!scopeKey) continue;
+    if (
+      n.metadata.editedScope === true ||
+      n.metadata.fileOpKind === "partial_edit" ||
+      n.metadata.fileOpKind === "full_write" ||
+      n.metadata.fileOpKind === "delete"
+    ) {
+      editedFileScopes.add(scopeKey);
+    }
+    if (isFileErrorNode(n)) {
+      errorTargetFileScopes.add(scopeKey);
+    }
+  }
+  const priorityFileScopes = new Set<string>([...editedFileScopes, ...errorTargetFileScopes]);
+
+  const isPriorityFileNode = (n: GraphNode): boolean => {
+    if (n.metadata.editedScope === true || n.metadata.fileOpKind === "ranged_read") {
+      return true;
+    }
+    if (isFileArtifactNode(n)) {
+      const sk = getFileScopeKey(n);
+      if (sk && priorityFileScopes.has(sk)) return true;
+    }
+    return false;
+  };
+
   const utilityOf = (n: GraphNode): number => {
     const base = pprScoreById.get(n.id) ?? 0.001;
     const isLatestUser = n.turn === maxTurn && n.role === "user";
-    return base * KIND_UTILITY_MULTIPLIER[n.kind] * (isLatestUser ? 2.5 : 1.0);
+    const isUnresolvedFailure = n.metadata.unresolvedFailure === true;
+    const kindMult = isUnresolvedFailure ? 2.2 : KIND_UTILITY_MULTIPLIER[n.kind];
+    const scopeBoost = !isUnresolvedFailure && isPriorityFileNode(n) ? 1.35 : 1.0;
+    return base * kindMult * scopeBoost * (isLatestUser ? 2.5 : 1.0);
   };
+
+  if (options.format === "compact_markdown") {
+    return compileCompactMarkdown({
+      store,
+      graph,
+      options,
+      focusQuery,
+      activeScope,
+      maxTokens,
+      zone1MaxRatio,
+      nodes,
+      activeNodes,
+      zone1Candidates,
+      zone2Candidates,
+      excludedNodes,
+      activeConflictEdges,
+      pprScoreById,
+      utilityOf,
+      isPriorityFileNode,
+      supersededOccluded,
+      retractedPruned,
+      fullLinearTokens,
+    });
+  }
 
   const rankedZone2 = [...zone2Candidates].sort((a, b) => utilityOf(b) - utilityOf(a));
 
@@ -386,10 +1178,14 @@ export function compileContext(store: GraphStore, options: CompileOptions): Comp
     const batchLods = new Map<string, LodLevel>();
     for (const member of batch) {
       const isCurrentPrompt = member.turn === maxTurn && member.role === "user";
+      const isPriorityFailure = member.metadata.unresolvedFailure === true;
+      const remBudget = availableZone2Budget - usedZone2Tokens - batchCost;
       const baseLod: LodLevel =
-        isCurrentPrompt && getRendered(member, "full").tokens <= availableZone2Budget - usedZone2Tokens
+        (isCurrentPrompt || isPriorityFailure) && getRendered(member, "full").tokens <= remBudget
           ? "full"
-          : "stub";
+          : isPriorityFailure && getRendered(member, "summary").tokens <= remBudget
+            ? "summary"
+            : "stub";
       batchLods.set(member.id, baseLod);
       batchCost += getRendered(member, baseLod).tokens;
     }
@@ -461,13 +1257,17 @@ export function compileContext(store: GraphStore, options: CompileOptions): Comp
       if (usedZone2Tokens + delta > availableZone2Budget) continue;
 
       const kindBoost =
-        node.kind === "artifact"
-          ? 1.75
-          : node.kind === "decision"
-            ? 1.45
-            : node.turn === maxTurn && node.role === "user"
-              ? 2.2
-              : 1.0;
+        node.metadata.unresolvedFailure === true
+          ? 2.4
+          : node.kind === "artifact"
+            ? isPriorityFileNode(node)
+              ? 1.95
+              : 1.75
+            : node.kind === "decision"
+              ? 1.45
+              : node.turn === maxTurn && node.role === "user"
+                ? 2.2
+                : 1.0;
       const stepGain = utilityOf(node) * kindBoost * (nextLod === "summary" ? 0.44 : 0.38);
       const priority = stepGain / Math.pow(Math.max(1, delta), 0.52);
       if (priority > bestPriority) {
@@ -610,8 +1410,10 @@ export function compileContext(store: GraphStore, options: CompileOptions): Comp
     let lowestScore = Infinity;
     for (let i = 0; i < zone2Entries.length - 1; i++) {
       const entry = zone2Entries[i]!;
-      if (entry.activationScore < lowestScore) {
-        lowestScore = entry.activationScore;
+      const z2Node = zone2ById.get(entry.id);
+      const score = z2Node ? utilityOf(z2Node) : entry.activationScore;
+      if (score < lowestScore) {
+        lowestScore = score;
         victimIdx = i;
       }
     }

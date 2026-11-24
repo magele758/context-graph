@@ -1,6 +1,7 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { ingestToolArtifacts, pruneTrajectoryEvents } from "./artifact-engine.ts";
 import { runBenchmark } from "./benchmark.ts";
 import { compileContext } from "./compiler.ts";
 import { GraphStore } from "./graph-store.ts";
@@ -11,7 +12,9 @@ import {
   type AddNodeInput,
   type CompileOptions,
   type CreateGraphInput,
+  type IngestArtifactsOptions,
   type IngestTurnInput,
+  type ToolTrajectoryEvent,
   type UpdateNodePatch,
 } from "./types.ts";
 
@@ -441,6 +444,62 @@ export function createContextGraphServer(
           const body = await readJsonBody(req);
           const result = store.ingestTurn(graphId, body as unknown as IngestTurnInput);
           sendJson(res, 201, { ok: true, ...result }, origin);
+          return;
+        }
+
+        if (subPath === "ingest-artifacts" && method === "POST") {
+          const body = await readJsonBody(req);
+          if (!Array.isArray(body.events)) {
+            throw new ContextGraphError(
+              "Request body must include an 'events' array",
+              "VALIDATION_ERROR",
+              400,
+            );
+          }
+          const events = body.events as ToolTrajectoryEvent[];
+          const rawOpts =
+            body.options && typeof body.options === "object" && !Array.isArray(body.options)
+              ? (body.options as IngestArtifactsOptions)
+              : {};
+          const ingestOpts: IngestArtifactsOptions = {
+            ...rawOpts,
+            ...(typeof body.scope === "string" ? { scope: body.scope } : {}),
+            ...(typeof body.turn === "number" ? { turn: body.turn } : {}),
+            ...(typeof body.machineId === "string" ? { machineId: body.machineId } : {}),
+            ...(typeof body.maxCodeExcerptChars === "number"
+              ? { maxCodeExcerptChars: body.maxCodeExcerptChars }
+              : {}),
+            ...(typeof body.maxCommandExcerptChars === "number"
+              ? { maxCommandExcerptChars: body.maxCommandExcerptChars }
+              : {}),
+          };
+
+          const ingested = ingestToolArtifacts(store, graphId, events, ingestOpts);
+          const pruned = body.prune === true ? pruneTrajectoryEvents(events) : undefined;
+          const compiled =
+            body.compile === true
+              ? compileContext(store, {
+                  ...(body.compileOptions &&
+                  typeof body.compileOptions === "object" &&
+                  !Array.isArray(body.compileOptions)
+                    ? (body.compileOptions as Omit<CompileOptions, "graphId">)
+                    : {}),
+                  graphId,
+                })
+              : undefined;
+
+          sendJson(
+            res,
+            200,
+            {
+              ok: true,
+              graphId,
+              ingested,
+              ...(pruned ? { pruned } : {}),
+              ...(compiled ? { compiled } : {}),
+            },
+            origin,
+          );
           return;
         }
 

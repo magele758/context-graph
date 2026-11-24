@@ -1,5 +1,7 @@
 export * from "./types.ts";
 export * from "./vector.ts";
+export * from "./excerpt.ts";
+export * from "./artifact-engine.ts";
 export * from "./graph-store.ts";
 export * from "./compiler.ts";
 export * from "./server.ts";
