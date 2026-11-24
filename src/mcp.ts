@@ -1,6 +1,11 @@
 import type { Readable, Writable } from "node:stream";
-import { ingestToolArtifacts, pruneTrajectoryEvents } from "./artifact-engine.ts";
-import { compileContext } from "./compiler.ts";
+import {
+  ingestToolArtifacts,
+  pruneTrajectoryEvents,
+  validateIngestArtifactsOptions,
+  validateToolEvents,
+} from "./artifact-engine.ts";
+import { compileContext, validateCompileOptions } from "./compiler.ts";
 import { GraphStore } from "./graph-store.ts";
 import {
   ContextGraphError,
@@ -8,11 +13,8 @@ import {
   NODE_KINDS,
   type AddEdgeInput,
   type AddNodeInput,
-  type CompileOptions,
   type CreateGraphInput,
-  type IngestArtifactsOptions,
   type IngestTurnInput,
-  type ToolTrajectoryEvent,
 } from "./types.ts";
 
 export const MCP_PROTOCOL_VERSION = "2024-11-05" as const;
@@ -166,6 +168,8 @@ export const MCP_TOOLS = [
         scope: { type: "string" },
         turn: { type: "integer" },
         machineId: { type: "string" },
+        maxCodeExcerptChars: { type: "integer" },
+        maxCommandExcerptChars: { type: "integer" },
         prune: { type: "boolean" },
         compile: { type: "boolean" },
         compileOptions: { type: "object" },
@@ -383,25 +387,18 @@ export class ContextGraphMcpSession {
       }
       case "cg_ingest_artifacts": {
         const graphId = String(args.graphId ?? "");
-        if (!Array.isArray(args.events)) {
-          throw new ContextGraphError("'events' array is required", "VALIDATION_ERROR", 400);
-        }
-        const events = args.events as ToolTrajectoryEvent[];
-        const ingestOpts: IngestArtifactsOptions = {
-          ...(typeof args.scope === "string" ? { scope: args.scope } : {}),
-          ...(typeof args.turn === "number" ? { turn: args.turn } : {}),
-          ...(typeof args.machineId === "string" ? { machineId: args.machineId } : {}),
-        };
+        const events = validateToolEvents(args.events);
+        const ingestOpts = validateIngestArtifactsOptions(args);
+        const validatedCompileOpts =
+          args.compileOptions !== undefined
+            ? validateCompileOptions(args.compileOptions)
+            : undefined;
         const ingested = ingestToolArtifacts(this.store, graphId, events, ingestOpts);
         const pruned = args.prune === true ? pruneTrajectoryEvents(events) : undefined;
         const compiled =
           args.compile === true
             ? compileContext(this.store, {
-                ...(args.compileOptions &&
-                typeof args.compileOptions === "object" &&
-                !Array.isArray(args.compileOptions)
-                  ? (args.compileOptions as Omit<CompileOptions, "graphId">)
-                  : {}),
+                ...(validatedCompileOpts ?? {}),
                 graphId,
               })
             : undefined;
@@ -415,8 +412,10 @@ export class ContextGraphMcpSession {
       }
       case "cg_compile_context": {
         const graphId = String(args.graphId ?? "");
+        const { graphId: _ignored, ...rest } = args;
+        const validatedOpts = validateCompileOptions(rest);
         const res = compileContext(this.store, {
-          ...(args as Omit<CompileOptions, "graphId">),
+          ...validatedOpts,
           graphId,
         });
         return {

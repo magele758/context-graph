@@ -2,21 +2,24 @@ import {
   compactCodeExcerpt,
   compactCommandExcerpt,
   sanitizeNeutralText,
+  stripRegexLinear,
   truncateAtWordBoundary,
 } from "./excerpt.ts";
 import type { GraphStore } from "./graph-store.ts";
-import type {
-  AgentLoopCompatibleMessage,
-  ChatMessage,
-  CompiledNodeEntry,
-  CompileOptions,
-  CompileResult,
-  ConflictWarning,
-  ExcludedNodeEntry,
-  GraphEdge,
-  GraphNode,
-  LodLevel,
-  NodeKind,
+import {
+  ContextGraphError,
+  type AgentLoopCompatibleMessage,
+  type ChatMessage,
+  type CompiledNodeEntry,
+  type CompileFormat,
+  type CompileOptions,
+  type CompileResult,
+  type ConflictWarning,
+  type ExcludedNodeEntry,
+  type GraphEdge,
+  type GraphNode,
+  type LodLevel,
+  type NodeKind,
 } from "./types.ts";
 import {
   cosineSimilarity,
@@ -103,9 +106,175 @@ function lexicalResourceBoost(query: string, node: GraphNode): number {
   return 0;
 }
 
+export const COMPILE_FORMATS: readonly CompileFormat[] = [
+  "both",
+  "messages",
+  "prompt",
+  "xml",
+  "compact_markdown",
+] as const;
+
 const DEFAULT_COMPACT_MAX_CHARS = 950 as const;
 const MAX_COMPACT_OUTPUT_CHARS = 4000 as const;
-const STALE_META_TAG_RE = /\s*\(v\d+,\s*[^,)]+,\s*(?:ok|err|error|failed)\)/gi;
+const STALE_META_TAG_RE = /\(v\d+,[ \t]*[^,)\n]+,[ \t]*(?:ok|err|error|failed)\)/gi;
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Validates HTTP / MCP / SDK compile options strictly, rejecting malformed
+ * types, invalid formats, or out-of-range numeric bounds with 400 VALIDATION_ERROR.
+ */
+export function validateCompileOptions(raw: unknown): Omit<CompileOptions, "graphId"> {
+  if (raw === undefined) return {};
+  if (!isPlainObject(raw)) {
+    throw new ContextGraphError("compileOptions must be a plain object", "VALIDATION_ERROR", 400);
+  }
+
+  const out: Omit<CompileOptions, "graphId"> = {};
+
+  if (raw.format !== undefined) {
+    if (typeof raw.format !== "string" || !COMPILE_FORMATS.includes(raw.format as CompileFormat)) {
+      throw new ContextGraphError(
+        `Invalid 'format' value; expected one of: ${COMPILE_FORMATS.join(", ")}`,
+        "VALIDATION_ERROR",
+        400,
+      );
+    }
+    out.format = raw.format as CompileFormat;
+  }
+
+  if (raw.maxOutputChars !== undefined) {
+    if (
+      typeof raw.maxOutputChars !== "number" ||
+      !Number.isInteger(raw.maxOutputChars) ||
+      raw.maxOutputChars < 1 ||
+      raw.maxOutputChars > MAX_COMPACT_OUTPUT_CHARS
+    ) {
+      throw new ContextGraphError(
+        `'maxOutputChars' must be an integer between 1 and ${MAX_COMPACT_OUTPUT_CHARS}`,
+        "VALIDATION_ERROR",
+        400,
+      );
+    }
+    out.maxOutputChars = raw.maxOutputChars;
+  }
+
+  if (raw.maxTokens !== undefined) {
+    if (
+      typeof raw.maxTokens !== "number" ||
+      !Number.isInteger(raw.maxTokens) ||
+      raw.maxTokens < 64
+    ) {
+      throw new ContextGraphError(
+        "'maxTokens' must be an integer >= 64",
+        "VALIDATION_ERROR",
+        400,
+      );
+    }
+    out.maxTokens = raw.maxTokens;
+  }
+
+  if (raw.zone1MaxRatio !== undefined) {
+    if (
+      typeof raw.zone1MaxRatio !== "number" ||
+      !Number.isFinite(raw.zone1MaxRatio) ||
+      raw.zone1MaxRatio <= 0 ||
+      raw.zone1MaxRatio >= 0.9
+    ) {
+      throw new ContextGraphError(
+        "'zone1MaxRatio' must be a finite number strictly between 0 and 0.9",
+        "VALIDATION_ERROR",
+        400,
+      );
+    }
+    out.zone1MaxRatio = raw.zone1MaxRatio;
+  }
+
+  if (raw.focusQuery !== undefined) {
+    if (typeof raw.focusQuery !== "string") {
+      throw new ContextGraphError("'focusQuery' must be a string", "VALIDATION_ERROR", 400);
+    }
+    out.focusQuery = raw.focusQuery;
+  }
+
+  if (raw.activeScope !== undefined) {
+    if (typeof raw.activeScope !== "string") {
+      throw new ContextGraphError("'activeScope' must be a string", "VALIDATION_ERROR", 400);
+    }
+    out.activeScope = raw.activeScope;
+  }
+
+  if (raw.focusNodeIds !== undefined) {
+    if (
+      !Array.isArray(raw.focusNodeIds) ||
+      !raw.focusNodeIds.every((id) => typeof id === "string")
+    ) {
+      throw new ContextGraphError(
+        "'focusNodeIds' must be an array of strings",
+        "VALIDATION_ERROR",
+        400,
+      );
+    }
+    out.focusNodeIds = raw.focusNodeIds;
+  }
+
+  if (raw.pprIterations !== undefined) {
+    if (
+      typeof raw.pprIterations !== "number" ||
+      !Number.isInteger(raw.pprIterations) ||
+      raw.pprIterations < 1 ||
+      raw.pprIterations > 100
+    ) {
+      throw new ContextGraphError(
+        "'pprIterations' must be an integer between 1 and 100",
+        "VALIDATION_ERROR",
+        400,
+      );
+    }
+    out.pprIterations = raw.pprIterations;
+  }
+
+  if (raw.pprAlpha !== undefined) {
+    if (
+      typeof raw.pprAlpha !== "number" ||
+      !Number.isFinite(raw.pprAlpha) ||
+      raw.pprAlpha <= 0 ||
+      raw.pprAlpha >= 1
+    ) {
+      throw new ContextGraphError(
+        "'pprAlpha' must be a finite number strictly between 0 and 1",
+        "VALIDATION_ERROR",
+        400,
+      );
+    }
+    out.pprAlpha = raw.pprAlpha;
+  }
+
+  if (raw.recordCacheState !== undefined) {
+    if (typeof raw.recordCacheState !== "boolean") {
+      throw new ContextGraphError("'recordCacheState' must be a boolean", "VALIDATION_ERROR", 400);
+    }
+    out.recordCacheState = raw.recordCacheState;
+  }
+
+  if (raw.previousTokenIds !== undefined) {
+    if (
+      !Array.isArray(raw.previousTokenIds) ||
+      !raw.previousTokenIds.every((t) => typeof t === "number" && Number.isInteger(t))
+    ) {
+      throw new ContextGraphError(
+        "'previousTokenIds' must be an array of integers",
+        "VALIDATION_ERROR",
+        400,
+      );
+    }
+    out.previousTokenIds = raw.previousTokenIds;
+  }
+
+  return out;
+}
 
 function getFileScopeKey(node: GraphNode): string | null {
   if (typeof node.metadata.fileScopeKey === "string" && node.metadata.fileScopeKey.trim()) {
@@ -149,7 +318,15 @@ function isCommandNode(node: GraphNode): boolean {
 }
 
 function cleanCompactFragment(text: string): string {
-  return sanitizeNeutralText(text).replace(STALE_META_TAG_RE, "").trim();
+  return stripRegexLinear(sanitizeNeutralText(text), STALE_META_TAG_RE).trim();
+}
+
+function collapseNewlinesToSpace(text: string): string {
+  return text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0)
+    .join(" ");
 }
 
 function flattenCodeLines(text: string): string {
@@ -268,7 +445,7 @@ function compileCompactMarkdown(args: CompactMarkdownBuildArgs): CompileResult {
   const maxOutputChars =
     typeof options.maxOutputChars === "number" &&
     Number.isFinite(options.maxOutputChars) &&
-    options.maxOutputChars >= 80
+    options.maxOutputChars >= 1
       ? Math.min(MAX_COMPACT_OUTPUT_CHARS, Math.floor(options.maxOutputChars))
       : DEFAULT_COMPACT_MAX_CHARS;
 
@@ -286,9 +463,10 @@ function compileCompactMarkdown(args: CompactMarkdownBuildArgs): CompileResult {
     const prefix = `- [${n.kind}]: `;
     const sep = zone1Entries.length > 0 ? 1 : 0;
     const rem = zone1CharCap - zone1UsedChars - sep;
-    if (rem <= prefix.length + 12) break;
-    const body = cleanCompactFragment(n.content).replace(/\s*\n+\s*/g, " ");
+    if (rem <= prefix.length + 4) break;
+    const body = collapseNewlinesToSpace(cleanCompactFragment(n.content));
     const fitted = truncateAtWordBoundary(body, rem - prefix.length);
+    if (!fitted) break;
     const line = `${prefix}${fitted}`;
     const lod: LodLevel = fitted.length >= body.length ? "full" : "summary";
     lodCounts[lod]++;
@@ -432,42 +610,65 @@ function compileCompactMarkdown(args: CompactMarkdownBuildArgs): CompileResult {
   };
 
   // --- Tier 1: Unresolved Failing Checks ---
-  if (tier1Nodes.length > 0 && remainingChars >= 40) {
+  if (tier1Nodes.length > 0 && remainingChars >= 1) {
     const tier1CapTotal =
       tier2Nodes.length > 0
         ? Math.min(remainingChars, Math.max(360, Math.floor(remainingChars * 0.45)))
         : remainingChars;
-    const tier1Prefixes = tier1Nodes.map((n) => {
+    const tier1Entries = tier1Nodes.map((n) => {
       const cmd =
         typeof n.metadata.command === "string" && n.metadata.command.trim()
           ? n.metadata.command.trim()
           : (n.resourceKey?.replace(/^cmd:/, "") ?? n.id);
-      return `- [check failed] \`${cmd}\`: `;
+      const prefix = `- [check failed] \`${cmd}\`: `;
+      const desiredBody = truncateAtWordBoundary(
+        flattenCommandLines(compactCommandExcerpt(n.content, false, 314)),
+        320,
+      );
+      return {
+        node: n,
+        prefix,
+        desiredBody,
+        desiredLen: prefix.length + desiredBody.length,
+      };
     });
-    const tier1Desired = tier1Nodes.map((n, i) => {
-      const ex = flattenCommandLines(compactCommandExcerpt(n.content, false, 314));
-      return tier1Prefixes[i]!.length + Math.min(320, ex.length);
-    });
-    const sepOverhead = Math.max(0, tier1Nodes.length - 1);
+    const sepOverhead = Math.max(0, tier1Entries.length - 1);
     const tier1Allocs = allocateWaterFilling(
-      tier1Desired,
+      tier1Entries.map((e) => e.desiredLen),
       Math.max(0, tier1CapTotal - sepOverhead),
     );
 
-    for (let i = 0; i < tier1Nodes.length; i++) {
-      const n = tier1Nodes[i]!;
-      const prefix = tier1Prefixes[i]!;
-      const alloc = tier1Allocs[i]!;
+    for (let i = 0; i < tier1Entries.length; i++) {
+      const entry = tier1Entries[i]!;
       const sep = zone2Lines.length > 0 ? 1 : 0;
-      const budget = Math.min(alloc, remainingChars - sep);
-      if (budget <= prefix.length + 12) continue;
-      const exBudget = budget - prefix.length;
-      const cmdBudget = exBudget > 48 ? exBudget - 6 : exBudget;
-      const rawEx = compactCommandExcerpt(n.content, false, cmdBudget);
-      const flat = truncateAtWordBoundary(flattenCommandLines(rawEx), exBudget);
+      const budget = Math.min(tier1Allocs[i]!, remainingChars - sep);
+      if (budget <= 0) continue;
+      if (budget <= entry.prefix.length + 4) {
+        // Tiny budget safety: keep a cleanly truncated lead snippet if nothing is emitted yet
+        if (zone1Entries.length === 0 && zone2Lines.length === 0) {
+          const tiny = truncateAtWordBoundary(
+            `${entry.prefix}${entry.desiredBody}`,
+            remainingChars - sep,
+          );
+          if (tiny) {
+            pushZone2Line({ tierRank: 1, text: tiny, nodes: [entry.node], lod: "stub" });
+          }
+        }
+        continue;
+      }
+      const exBudget = budget - entry.prefix.length;
+      let flat: string;
+      if (exBudget >= entry.desiredBody.length) {
+        // Emit cached desiredBody directly to prevent double-squeezing signal loss
+        flat = entry.desiredBody;
+      } else {
+        const cmdBudget = exBudget > 48 ? exBudget - 6 : exBudget;
+        const rawEx = compactCommandExcerpt(entry.node.content, false, cmdBudget);
+        flat = truncateAtWordBoundary(flattenCommandLines(rawEx), exBudget);
+      }
       if (!flat) continue;
-      const line = `${prefix}${flat}`;
-      pushZone2Line({ tierRank: 1, text: line, nodes: [n], lod: "full" });
+      const line = `${entry.prefix}${flat}`;
+      pushZone2Line({ tierRank: 1, text: line, nodes: [entry.node], lod: "full" });
     }
   }
 
@@ -503,7 +704,7 @@ function compileCompactMarkdown(args: CompactMarkdownBuildArgs): CompileResult {
   };
 
   // --- Tier 2: Edited scopes, #edit deltas, ranged chunks, failed-edit target files, decisions ---
-  if (tier2Nodes.length > 0 && remainingChars >= 36) {
+  if (tier2Nodes.length > 0 && remainingChars >= 1) {
     const previewOther = buildOtherReadFilesLine(140);
     const otherReserve =
       previewOther && remainingChars - (previewOther.line.length + 1) >= tier2Nodes.length * 160
@@ -534,14 +735,15 @@ function compileCompactMarkdown(args: CompactMarkdownBuildArgs): CompileResult {
 
     const renderTier2Body = (n: GraphNode, cap: number): string => {
       if (isFileErrorNode(n)) {
+        const errCap = Math.min(cap, 180);
         return truncateAtWordBoundary(
-          flattenCommandLines(compactCommandExcerpt(n.content, false, Math.min(cap, 180))),
+          flattenCommandLines(compactCommandExcerpt(n.content, false, errCap > 48 ? errCap - 6 : errCap)),
           cap,
         );
       }
       if (n.kind === "decision") {
         return truncateAtWordBoundary(
-          cleanCompactFragment(n.content).replace(/\s*\n+\s*/g, " "),
+          collapseNewlinesToSpace(cleanCompactFragment(n.content)),
           cap,
         );
       }
@@ -549,35 +751,58 @@ function compileCompactMarkdown(args: CompactMarkdownBuildArgs): CompileResult {
       return truncateAtWordBoundary(flattenCodeLines(codeEx), cap);
     };
 
-    const tier2Prefixes = tier2Nodes.map((n) => buildTier2Prefix(n));
-    const tier2Desired = tier2Nodes.map((n, i) => {
+    const tier2Entries = tier2Nodes.map((n) => {
+      const prefix = buildTier2Prefix(n);
       const cap = isFileErrorNode(n) ? 160 : 340;
-      const body = renderTier2Body(n, cap);
-      return tier2Prefixes[i]!.length + body.length;
+      const desiredBody = renderTier2Body(n, cap);
+      return {
+        node: n,
+        prefix,
+        desiredBody,
+        desiredLen: prefix.length + desiredBody.length,
+      };
     });
 
     const sepOverhead =
-      (zone2Lines.length > 0 ? 1 : 0) + Math.max(0, tier2Nodes.length - 1);
+      (zone2Lines.length > 0 ? 1 : 0) + Math.max(0, tier2Entries.length - 1);
     const tier2Allocs = allocateWaterFilling(
-      tier2Desired,
+      tier2Entries.map((e) => e.desiredLen),
       Math.max(0, tier2BudgetPool - sepOverhead),
     );
 
-    for (let i = 0; i < tier2Nodes.length; i++) {
-      const n = tier2Nodes[i]!;
-      const prefix = tier2Prefixes[i]!;
+    for (let i = 0; i < tier2Entries.length; i++) {
+      const entry = tier2Entries[i]!;
       const sep = zone2Lines.length > 0 ? 1 : 0;
       const budget = Math.min(tier2Allocs[i]!, remainingChars - sep);
-      if (budget <= prefix.length + 10) continue;
-      const exBudget = budget - prefix.length;
-      const body = renderTier2Body(n, exBudget);
+      if (budget <= 0) continue;
+      if (budget <= entry.prefix.length + 4) {
+        if (zone1Entries.length === 0 && zone2Lines.length === 0) {
+          const tiny = truncateAtWordBoundary(
+            `${entry.prefix}${entry.desiredBody}`,
+            remainingChars - sep,
+          );
+          if (tiny) {
+            pushZone2Line({ tierRank: 2, text: tiny, nodes: [entry.node], lod: "stub" });
+          }
+        }
+        continue;
+      }
+      const exBudget = budget - entry.prefix.length;
+      // Reuse cached desiredBody directly when it fits to prevent re-excerption double-squeezing
+      const body =
+        exBudget >= entry.desiredBody.length
+          ? entry.desiredBody
+          : renderTier2Body(entry.node, exBudget);
       if (!body) continue;
-      const line = `${prefix}${body}`;
+      const line = `${entry.prefix}${body}`;
+      const fullFlattenedLen = isFileArtifactNode(entry.node)
+        ? flattenCodeLines(entry.node.content).length
+        : cleanCompactFragment(entry.node.content).length;
       pushZone2Line({
         tierRank: 2,
         text: line,
-        nodes: [n],
-        lod: body.length >= cleanCompactFragment(n.content).length ? "full" : "summary",
+        nodes: [entry.node],
+        lod: body.length >= fullFlattenedLen ? "full" : "summary",
       });
     }
   }
@@ -623,7 +848,7 @@ function compileCompactMarkdown(args: CompactMarkdownBuildArgs): CompileResult {
     const exCap = Math.min(180, remainingChars - sep - prefix.length);
     if (exCap < 12) break;
     const body = truncateAtWordBoundary(
-      cleanCompactFragment(n.content).replace(/\s*\n+\s*/g, " "),
+      collapseNewlinesToSpace(cleanCompactFragment(n.content)),
       exCap,
     );
     if (!body) continue;
@@ -699,15 +924,17 @@ function compileCompactMarkdown(args: CompactMarkdownBuildArgs): CompileResult {
     tokenIds = tokenizeToIds(finalPromptText);
   }
 
+  // Final cleanliness pass guaranteeing zero pruned/head-tail markers and synced messages
+  let hardTruncated = false;
   if (finalPromptText.length > maxOutputChars) {
     finalPromptText = truncateAtWordBoundary(finalPromptText, maxOutputChars);
-    tokenIds = tokenizeToIds(finalPromptText);
+    hardTruncated = true;
   }
 
-  // Final cleanliness pass guaranteeing zero pruned/head-tail markers
   finalPromptText = cleanCompactFragment(finalPromptText);
   if (finalPromptText.length > maxOutputChars) {
     finalPromptText = truncateAtWordBoundary(finalPromptText, maxOutputChars);
+    hardTruncated = true;
   }
   tokenIds = tokenizeToIds(finalPromptText);
 
@@ -749,15 +976,37 @@ function compileCompactMarkdown(args: CompactMarkdownBuildArgs): CompileResult {
     }
   }
 
-  const zone1Text = zone1Entries.map((e) => e.renderedText).join("\n");
-  const zone2Text = zone2Lines.map((l) => l.text).join("\n");
+  let zone1Text = cleanCompactFragment(zone1Entries.map((e) => e.renderedText).join("\n"));
+  let zone2Text = cleanCompactFragment(zone2Lines.map((l) => l.text).join("\n"));
 
   const messages: ChatMessage[] = [];
-  if (zone1Text) {
-    messages.push({ role: "system", name: "zone_1_stable_prefix", content: zone1Text });
-  }
-  if (zone2Text) {
-    messages.push({ role: "user", name: "zone_2_working_subgraph", content: zone2Text });
+  if (hardTruncated) {
+    // Keep messages strictly consistent with final truncated promptText
+    if (finalPromptText) {
+      const onlyZone1 = zone1Entries.length > 0 && zone2Lines.length === 0;
+      messages.push({
+        role: onlyZone1 ? "system" : "user",
+        name: onlyZone1 ? "zone_1_stable_prefix" : "zone_2_working_subgraph",
+        content: finalPromptText,
+      });
+      if (onlyZone1) {
+        zone1Text = finalPromptText;
+        zone2Text = "";
+      } else {
+        zone1Text = "";
+        zone2Text = finalPromptText;
+      }
+    } else {
+      zone1Text = "";
+      zone2Text = "";
+    }
+  } else {
+    if (zone1Text) {
+      messages.push({ role: "system", name: "zone_1_stable_prefix", content: zone1Text });
+    }
+    if (zone2Text) {
+      messages.push({ role: "user", name: "zone_2_working_subgraph", content: zone2Text });
+    }
   }
 
   const agentLoopMessages: AgentLoopCompatibleMessage[] = [
@@ -830,21 +1079,27 @@ function compileCompactMarkdown(args: CompactMarkdownBuildArgs): CompileResult {
 }
 
 export function compileContext(store: GraphStore, options: CompileOptions): CompileResult {
-  const snapshot = store.getGraphSnapshot(options.graphId);
+  const { graphId, ...rawCompileOpts } = options;
+  const validatedOpts = validateCompileOptions(rawCompileOpts);
+  const effectiveOptions: CompileOptions = { ...validatedOpts, graphId };
+
+  const snapshot = store.getGraphSnapshot(effectiveOptions.graphId);
   const { graph, nodes, edges } = snapshot;
 
-  const focusQuery = options.focusQuery?.trim() ?? "";
-  const activeScope = options.activeScope?.trim() || "global";
+  const focusQuery = effectiveOptions.focusQuery?.trim() ?? "";
+  const activeScope = effectiveOptions.activeScope?.trim() || "global";
   const maxTokens =
-    typeof options.maxTokens === "number" && options.maxTokens >= 64
-      ? Math.floor(options.maxTokens)
+    typeof effectiveOptions.maxTokens === "number" && effectiveOptions.maxTokens >= 64
+      ? Math.floor(effectiveOptions.maxTokens)
       : graph.defaultBudget;
   const zone1MaxRatio =
-    typeof options.zone1MaxRatio === "number" && options.zone1MaxRatio > 0 && options.zone1MaxRatio < 0.9
-      ? options.zone1MaxRatio
+    typeof effectiveOptions.zone1MaxRatio === "number" &&
+    effectiveOptions.zone1MaxRatio > 0 &&
+    effectiveOptions.zone1MaxRatio < 0.9
+      ? effectiveOptions.zone1MaxRatio
       : 0.45;
-  const pprAlpha = options.pprAlpha ?? 0.85;
-  const pprIterations = options.pprIterations ?? 20;
+  const pprAlpha = effectiveOptions.pprAlpha ?? 0.85;
+  const pprIterations = effectiveOptions.pprIterations ?? 20;
 
   const resolutionMap = buildForwardResolutionMap(nodes);
   const excludedNodes: ExcludedNodeEntry[] = [];

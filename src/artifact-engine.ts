@@ -5,16 +5,17 @@ import {
   truncateAtWordBoundary,
 } from "./excerpt.ts";
 import type { GraphStore } from "./graph-store.ts";
-import type {
-  ClassifiedToolEvent,
-  FileOpKind,
-  GraphEdge,
-  GraphNode,
-  IngestArtifactsOptions,
-  IngestArtifactsResult,
-  PrunedTrajectoryEvent,
-  PruneTrajectoryResult,
-  ToolTrajectoryEvent,
+import {
+  ContextGraphError,
+  type ClassifiedToolEvent,
+  type FileOpKind,
+  type GraphEdge,
+  type GraphNode,
+  type IngestArtifactsOptions,
+  type IngestArtifactsResult,
+  type PrunedTrajectoryEvent,
+  type PruneTrajectoryResult,
+  type ToolTrajectoryEvent,
 } from "./types.ts";
 import { countTokens, deterministicId } from "./vector.ts";
 
@@ -48,6 +49,213 @@ const SEARCH_TOOLS = new Set([
 
 const DEFAULT_CODE_EXCERPT_CHARS = 600;
 const DEFAULT_CMD_EXCERPT_CHARS = 420;
+export const MAX_TOOL_EVENTS_PER_BATCH = 2000 as const;
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Validates raw HTTP / MCP `events` payload strictly, enforcing batch bounds
+ * (`<= 2000`) and full per-item schema safety so malformed payloads always fail
+ * cleanly with `ContextGraphError("VALIDATION_ERROR", 400)` instead of HTTP 500.
+ */
+export function validateToolEvents(raw: unknown): ToolTrajectoryEvent[] {
+  if (!Array.isArray(raw)) {
+    throw new ContextGraphError(
+      "Request body must include an 'events' array",
+      "VALIDATION_ERROR",
+      400,
+    );
+  }
+  if (raw.length > MAX_TOOL_EVENTS_PER_BATCH) {
+    throw new ContextGraphError(
+      `'events' array exceeds maximum batch size of ${MAX_TOOL_EVENTS_PER_BATCH}`,
+      "VALIDATION_ERROR",
+      400,
+    );
+  }
+
+  const validated: ToolTrajectoryEvent[] = new Array(raw.length);
+  for (let i = 0; i < raw.length; i++) {
+    const item = raw[i];
+    if (!isPlainObject(item)) {
+      throw new ContextGraphError(
+        `events[${i}] must be a non-null plain object`,
+        "VALIDATION_ERROR",
+        400,
+      );
+    }
+    if (typeof item.callId !== "string" || item.callId.trim().length === 0) {
+      throw new ContextGraphError(
+        `events[${i}].callId must be a non-empty string`,
+        "VALIDATION_ERROR",
+        400,
+      );
+    }
+    if (typeof item.tool !== "string" || item.tool.trim().length === 0) {
+      throw new ContextGraphError(
+        `events[${i}].tool must be a non-empty string`,
+        "VALIDATION_ERROR",
+        400,
+      );
+    }
+    if (typeof item.output !== "string") {
+      throw new ContextGraphError(
+        `events[${i}].output must be a string`,
+        "VALIDATION_ERROR",
+        400,
+      );
+    }
+    if (typeof item.ok !== "boolean") {
+      throw new ContextGraphError(
+        `events[${i}].ok must be a boolean`,
+        "VALIDATION_ERROR",
+        400,
+      );
+    }
+    if (item.args !== undefined && !isPlainObject(item.args)) {
+      throw new ContextGraphError(
+        `events[${i}].args must be a plain object when provided`,
+        "VALIDATION_ERROR",
+        400,
+      );
+    }
+    if (item.machineId !== undefined && typeof item.machineId !== "string") {
+      throw new ContextGraphError(
+        `events[${i}].machineId must be a string when provided`,
+        "VALIDATION_ERROR",
+        400,
+      );
+    }
+    if (item.scope !== undefined && typeof item.scope !== "string") {
+      throw new ContextGraphError(
+        `events[${i}].scope must be a string when provided`,
+        "VALIDATION_ERROR",
+        400,
+      );
+    }
+    if (
+      item.turn !== undefined &&
+      (typeof item.turn !== "number" || !Number.isInteger(item.turn) || item.turn < 1)
+    ) {
+      throw new ContextGraphError(
+        `events[${i}].turn must be a positive integer when provided`,
+        "VALIDATION_ERROR",
+        400,
+      );
+    }
+    if (
+      item.seq !== undefined &&
+      (typeof item.seq !== "number" || !Number.isInteger(item.seq) || item.seq < 0)
+    ) {
+      throw new ContextGraphError(
+        `events[${i}].seq must be a non-negative integer when provided`,
+        "VALIDATION_ERROR",
+        400,
+      );
+    }
+
+    validated[i] = {
+      callId: item.callId,
+      tool: item.tool,
+      ok: item.ok,
+      output: item.output,
+      ...(item.args !== undefined ? { args: item.args } : {}),
+      ...(item.machineId !== undefined ? { machineId: item.machineId } : {}),
+      ...(item.scope !== undefined ? { scope: item.scope } : {}),
+      ...(item.turn !== undefined ? { turn: item.turn } : {}),
+      ...(item.seq !== undefined ? { seq: item.seq } : {}),
+    };
+  }
+  return validated;
+}
+
+/**
+ * Validates optional ingestion fields on HTTP `/ingest-artifacts` and MCP `cg_ingest_artifacts`.
+ */
+export function validateIngestArtifactsOptions(
+  raw: Record<string, unknown>,
+): IngestArtifactsOptions {
+  if (raw.options !== undefined && !isPlainObject(raw.options)) {
+    throw new ContextGraphError(
+      "'options' must be a plain object when provided",
+      "VALIDATION_ERROR",
+      400,
+    );
+  }
+  if (raw.prune !== undefined && typeof raw.prune !== "boolean") {
+    throw new ContextGraphError("'prune' must be a boolean", "VALIDATION_ERROR", 400);
+  }
+  if (raw.compile !== undefined && typeof raw.compile !== "boolean") {
+    throw new ContextGraphError("'compile' must be a boolean", "VALIDATION_ERROR", 400);
+  }
+
+  const nested = isPlainObject(raw.options) ? raw.options : {};
+  const merged: Record<string, unknown> = {
+    ...nested,
+    ...(raw.scope !== undefined ? { scope: raw.scope } : {}),
+    ...(raw.turn !== undefined ? { turn: raw.turn } : {}),
+    ...(raw.machineId !== undefined ? { machineId: raw.machineId } : {}),
+    ...(raw.maxCodeExcerptChars !== undefined
+      ? { maxCodeExcerptChars: raw.maxCodeExcerptChars }
+      : {}),
+    ...(raw.maxCommandExcerptChars !== undefined
+      ? { maxCommandExcerptChars: raw.maxCommandExcerptChars }
+      : {}),
+  };
+
+  if (merged.scope !== undefined && typeof merged.scope !== "string") {
+    throw new ContextGraphError("'scope' must be a string", "VALIDATION_ERROR", 400);
+  }
+  if (merged.machineId !== undefined && typeof merged.machineId !== "string") {
+    throw new ContextGraphError("'machineId' must be a string", "VALIDATION_ERROR", 400);
+  }
+  if (
+    merged.turn !== undefined &&
+    (typeof merged.turn !== "number" || !Number.isInteger(merged.turn) || merged.turn < 1)
+  ) {
+    throw new ContextGraphError("'turn' must be a positive integer", "VALIDATION_ERROR", 400);
+  }
+  if (
+    merged.maxCodeExcerptChars !== undefined &&
+    (typeof merged.maxCodeExcerptChars !== "number" ||
+      !Number.isInteger(merged.maxCodeExcerptChars) ||
+      merged.maxCodeExcerptChars < 1 ||
+      merged.maxCodeExcerptChars > 20000)
+  ) {
+    throw new ContextGraphError(
+      "'maxCodeExcerptChars' must be an integer between 1 and 20000",
+      "VALIDATION_ERROR",
+      400,
+    );
+  }
+  if (
+    merged.maxCommandExcerptChars !== undefined &&
+    (typeof merged.maxCommandExcerptChars !== "number" ||
+      !Number.isInteger(merged.maxCommandExcerptChars) ||
+      merged.maxCommandExcerptChars < 1 ||
+      merged.maxCommandExcerptChars > 20000)
+  ) {
+    throw new ContextGraphError(
+      "'maxCommandExcerptChars' must be an integer between 1 and 20000",
+      "VALIDATION_ERROR",
+      400,
+    );
+  }
+
+  return {
+    ...(merged.scope !== undefined ? { scope: merged.scope } : {}),
+    ...(merged.turn !== undefined ? { turn: merged.turn } : {}),
+    ...(merged.machineId !== undefined ? { machineId: merged.machineId } : {}),
+    ...(merged.maxCodeExcerptChars !== undefined
+      ? { maxCodeExcerptChars: merged.maxCodeExcerptChars }
+      : {}),
+    ...(merged.maxCommandExcerptChars !== undefined
+      ? { maxCommandExcerptChars: merged.maxCommandExcerptChars }
+      : {}),
+  };
+}
 
 function readStringArg(
   args: Record<string, unknown> | undefined,
@@ -94,14 +302,22 @@ function readFiniteIntArg(
   return undefined;
 }
 
+function trimTrailingSlashes(s: string): string {
+  let end = s.length;
+  while (end > 0 && s.charCodeAt(end - 1) === 47) {
+    end--;
+  }
+  return end === s.length ? s : s.slice(0, end);
+}
+
 export function normalizeArtifactPath(rawPath: string): string {
   const unified = rawPath.trim().replace(/\\/g, "/");
   const isAbs = unified.startsWith("/");
   const collapsed = unified.replace(/\/{2,}/g, "/");
   if (isAbs) {
-    return collapsed.length > 1 ? collapsed.replace(/\/+$/, "") : collapsed;
+    return collapsed.length > 1 ? trimTrailingSlashes(collapsed) || "/" : collapsed;
   }
-  const stripped = collapsed.replace(/^(?:\.\/)+/, "").replace(/\/+$/, "");
+  const stripped = trimTrailingSlashes(collapsed.replace(/^(?:\.\/)+/, ""));
   return stripped || ".";
 }
 

@@ -2073,3 +2073,352 @@ describe("v0.2 HTTP /ingest-artifacts, Compile Formats & MCP Tool Annotations E2
     }
   });
 });
+
+describe("v0.2 Review Hardening Regression Suite (B1-B4 & NB1-NB3)", () => {
+  it("38. [B1] executes ReDoS-adversarial inputs in strictly linear O(N) time (< 100ms)", () => {
+    const spaces = " ".repeat(20_000) + "x";
+    const brackets = "[".repeat(20_000);
+    const parens = "(".repeat(20_000);
+    const repeatedPaths = "src/".repeat(5_000);
+    const inputs = [spaces, brackets, parens, repeatedPaths];
+
+    const store = new GraphStore(":memory:");
+    const g = store.createGraph({ id: "g_redos", name: "ReDoS Regression" });
+    ingestToolArtifacts(store, g.id, [
+      {
+        callId: "rd1",
+        tool: "read_file",
+        args: { path: "src/spaces.ts" },
+        ok: true,
+        output: spaces,
+      },
+      {
+        callId: "rd2",
+        tool: "read_file",
+        args: { path: "src/brackets.ts" },
+        ok: true,
+        output: brackets,
+      },
+      {
+        callId: "rd3",
+        tool: "bash",
+        args: { command: "npm test" },
+        ok: false,
+        output: `${parens}\n${repeatedPaths}`,
+      },
+    ]);
+
+    const t0 = Date.now();
+    for (const s of inputs) {
+      sanitizeNeutralText(s);
+      compactCommandExcerpt(s, false, 300);
+    }
+    const compiled = compileContext(store, {
+      graphId: g.id,
+      format: "compact_markdown",
+      maxOutputChars: 950,
+    });
+    const elapsedMs = Date.now() - t0;
+
+    assert.ok(compiled.promptText.length <= 950);
+    assert.ok(
+      elapsedMs < 100,
+      `Expected strictly linear O(N) execution < 100ms, got ${elapsedMs}ms`,
+    );
+    store.close();
+  });
+
+  it("39. [B2 & NB3] rejects malformed HTTP / MCP payloads with 400 VALIDATION_ERROR and forwards MCP excerpt limits", async () => {
+    const token = "cg_v2_validation_hardening_secret_key";
+    const app = createContextGraphServer({ dataPath: ":memory:", port: 0, authToken: token });
+    const bound = await app.start(0, "127.0.0.1");
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    };
+
+    try {
+      await fetch(`${bound.url}/v1/graphs`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ id: "g_val", name: "Validation Graph" }),
+      });
+
+      const assert400 = async (path: string, payload: unknown, label: string) => {
+        const res = await fetch(`${bound.url}${path}`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(payload),
+        });
+        assert.equal(res.status, 400, `${label}: expected HTTP 400, got ${res.status}`);
+        const body = (await res.json()) as { ok: boolean; error: { code: string } };
+        assert.equal(body.ok, false);
+        assert.equal(body.error.code, "VALIDATION_ERROR", `${label}: expected VALIDATION_ERROR`);
+      };
+
+      // Malformed events payloads -> 400 VALIDATION_ERROR (never 500 or 200)
+      await assert400("/v1/graphs/g_val/ingest-artifacts", { events: [null] }, "events:[null]");
+      await assert400(
+        "/v1/graphs/g_val/ingest-artifacts",
+        { events: [{ callId: "1", tool: 123, ok: true, output: "x" }] },
+        "non-string tool",
+      );
+      await assert400(
+        "/v1/graphs/g_val/ingest-artifacts",
+        { events: [{ callId: "1", tool: "read_file", ok: true, output: { bad: 1 } }] },
+        "non-string output",
+      );
+      await assert400(
+        "/v1/graphs/g_val/ingest-artifacts",
+        { events: [{ callId: "", tool: "read_file", ok: true, output: "x" }] },
+        "empty callId",
+      );
+      await assert400(
+        "/v1/graphs/g_val/ingest-artifacts",
+        { events: [{ callId: "1", tool: "read_file", ok: true, output: "x", machineId: 42 }] },
+        "non-string machineId",
+      );
+      await assert400(
+        "/v1/graphs/g_val/ingest-artifacts",
+        { events: [{ callId: "1", tool: "read_file", ok: "yes", output: "x" }] },
+        "non-boolean ok",
+      );
+      const tooMany = Array.from({ length: 2001 }, (_, i) => ({
+        callId: `c${i}`,
+        tool: "read_file",
+        args: { path: "src/a.ts" },
+        ok: true,
+        output: "x",
+      }));
+      await assert400("/v1/graphs/g_val/ingest-artifacts", { events: tooMany }, ">2000 events");
+
+      // Invalid compileOptions on /ingest-artifacts fails BEFORE mutating graph
+      await assert400(
+        "/v1/graphs/g_val/ingest-artifacts",
+        {
+          events: [{ callId: "atomic_1", tool: "read_file", args: { path: "src/a.ts" }, ok: true, output: "const A = 1;" }],
+          compile: true,
+          compileOptions: { format: "bogus_format" },
+        },
+        "bogus compileOptions.format",
+      );
+      assert.equal(app.store.listNodes("g_val").length, 0, "Invalid compileOptions must reject atomically before ingestion");
+
+      // Malformed /compile payloads -> 400 VALIDATION_ERROR
+      await assert400("/v1/graphs/g_val/compile", { format: "yaml" }, "bogus format");
+      await assert400("/v1/graphs/g_val/compile", { maxOutputChars: -5 }, "negative maxOutputChars");
+      await assert400("/v1/graphs/g_val/compile", { maxOutputChars: 0 }, "zero maxOutputChars");
+      await assert400("/v1/graphs/g_val/compile", { maxOutputChars: 4001 }, "oversized maxOutputChars");
+      await assert400("/v1/graphs/g_val/compile", { maxOutputChars: "500" }, "string maxOutputChars");
+      await assert400("/v1/graphs/g_val/compile", { focusQuery: 999 }, "non-string focusQuery");
+      await assert400("/v1/graphs/g_val/compile", { pprIterations: 0 }, "pprIterations=0");
+      await assert400("/v1/graphs/g_val/compile", { pprIterations: 101 }, "pprIterations=101");
+      await assert400("/v1/graphs/g_val/compile", { pprAlpha: 1.5 }, "pprAlpha>1");
+      await assert400("/v1/graphs/g_val/compile", { focusNodeIds: [123] }, "non-string focusNodeIds");
+
+      // MCP validation errors surface cleanly as isError: true with VALIDATION_ERROR,
+      // and MCP cg_ingest_artifacts forwards maxCodeExcerptChars / maxCommandExcerptChars
+      const mcpBad = await fetch(`${bound.url}/mcp`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 10,
+          method: "tools/call",
+          params: {
+            name: "cg_ingest_artifacts",
+            arguments: { graphId: "g_val", events: [null] },
+          },
+        }),
+      });
+      const mcpBadBody = (await mcpBad.json()) as {
+        result: { isError: boolean; content: Array<{ text: string }> };
+      };
+      assert.equal(mcpBadBody.result.isError, true);
+      assert.ok(mcpBadBody.result.content[0]?.text.includes("VALIDATION_ERROR"));
+
+      const mcpCaps = await fetch(`${bound.url}/mcp`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 11,
+          method: "tools/call",
+          params: {
+            name: "cg_ingest_artifacts",
+            arguments: {
+              graphId: "g_val",
+              maxCodeExcerptChars: 70,
+              maxCommandExcerptChars: 80,
+              events: [
+                {
+                  callId: "mc1",
+                  tool: "read_file",
+                  args: { path: "src/long.ts" },
+                  ok: true,
+                  output: "export const ALPHA = 1;\nexport const BETA = 2;\nexport const GAMMA = 3;\nexport const DELTA = 4;",
+                },
+                {
+                  callId: "mc2",
+                  tool: "bash",
+                  args: { command: "npm test" },
+                  ok: false,
+                  output: "FAIL src/long.test.ts\nError [ERR_DEMO_FAIL]: something failed in long test suite\n  at run (src/long.ts:1:1)",
+                },
+              ],
+            },
+          },
+        }),
+      });
+      const mcpCapsBody = (await mcpCaps.json()) as { result: { isError: boolean } };
+      assert.equal(mcpCapsBody.result.isError, false);
+      const storedNodes = app.store.listNodes("g_val");
+      const codeNode = storedNodes.find((n) => n.resourceKey === "file:src/long.ts")!;
+      const cmdNode = storedNodes.find((n) => n.resourceKey === "cmd:npm test")!;
+      assert.ok(codeNode.content.length <= 70, `Expected <= 70, got ${codeNode.content.length}`);
+      assert.ok(cmdNode.content.length <= 80, `Expected <= 80, got ${cmdNode.content.length}`);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("40. [B3, NB2 & NB3] strictly enforces small maxOutputChars (20, 50, 79, 80), guards non-finite caps, and syncs messages", () => {
+    // NB2: non-finite & float guards
+    assert.equal(truncateAtWordBoundary("hello world", Number.NaN), "");
+    assert.equal(truncateAtWordBoundary("hello world", Number.POSITIVE_INFINITY), "");
+    assert.equal(truncateAtWordBoundary("hello world", -10), "");
+    const floatCut = truncateAtWordBoundary("alpha beta gamma", 9.9);
+    assert.ok(floatCut.length <= 9);
+
+    const store = new GraphStore(":memory:");
+    const g = store.createGraph({ id: "g_tiny_cap", name: "Tiny maxOutputChars" });
+    store.addNode(g.id, {
+      id: "c_pin",
+      kind: "constraint",
+      tier: "pinned_prefix",
+      content: "Keep output strictly bounded at every character cap.",
+    });
+    ingestToolArtifacts(store, g.id, [
+      {
+        callId: "t1",
+        tool: "read_file",
+        args: { path: "src/service.ts" },
+        ok: true,
+        output: "export const SERVICE_PORT = 9090;\nexport function startService() { return SERVICE_PORT; }",
+      },
+      {
+        callId: "t2",
+        tool: "bash",
+        args: { command: "npm test" },
+        ok: false,
+        output: "FAIL src/service.test.ts\nError [ERR_BIND_FAIL]: port busy\n  at startService (src/service.ts:2:10)",
+      },
+    ]);
+
+    for (const cap of [20, 50, 79, 80]) {
+      const res = compileContext(store, {
+        graphId: g.id,
+        format: "compact_markdown",
+        maxOutputChars: cap,
+        recordCacheState: false,
+      });
+      assert.ok(
+        res.promptText.length <= cap,
+        `maxOutputChars=${cap}: expected promptText.length <= ${cap}, got ${res.promptText.length} (${res.promptText})`,
+      );
+      const msgJoined = res.messages.map((m) => m.content).join("\n");
+      assert.ok(
+        msgJoined.length <= cap,
+        `maxOutputChars=${cap}: messages must stay <= ${cap}, got ${msgJoined.length}`,
+      );
+      assert.equal(msgJoined, res.promptText, `maxOutputChars=${cap}: messages must stay synced with promptText`);
+    }
+    store.close();
+  });
+
+  it("41. [B4] eliminates Tier 1 & Tier 2 double-squeezing so full FAIL header and indented file bodies stay intact", () => {
+    const store = new GraphStore(":memory:");
+    const g = store.createGraph({ id: "g_nosqueeze", name: "No Double Squeeze" });
+
+    const singleFailure =
+      "FAIL src/auth.test.ts\nError [ERR_TOKEN_INVALID]: bad signature\n  at verify (src/auth.ts:42:9)";
+    assert.equal(singleFailure.length, 93);
+
+    const indentedFile = [
+      "export function buildPolicy() {",
+      "    const retries = 3;",
+      "    const timeoutMs = 1500;",
+      "    const strict = true;",
+      "    return { retries, timeoutMs, strict };",
+      "}",
+    ].join("\n");
+    assert.ok(indentedFile.length >= 140 && indentedFile.length <= 170);
+
+    ingestToolArtifacts(store, g.id, [
+      {
+        callId: "ns_r",
+        tool: "read_file",
+        args: { path: "src/policy.ts" },
+        ok: true,
+        output: indentedFile,
+      },
+      {
+        callId: "ns_w",
+        tool: "write_file",
+        args: { path: "src/policy.ts", content: indentedFile },
+        ok: true,
+        output: "Wrote src/policy.ts",
+      },
+      {
+        callId: "ns_f",
+        tool: "bash",
+        args: { command: "npm test" },
+        ok: false,
+        output: singleFailure,
+      },
+    ]);
+
+    const compiled = compileContext(store, {
+      graphId: g.id,
+      format: "compact_markdown",
+      maxOutputChars: 950,
+    });
+
+    // Tier 1: must preserve FAIL header + error diagnostic + app stack frame completely
+    assert.ok(
+      compiled.promptText.includes("FAIL src/auth.test.ts"),
+      `Tier 1 must preserve FAIL header without double-squeezing:\n${compiled.promptText}`,
+    );
+    assert.ok(compiled.promptText.includes("Error [ERR_TOKEN_INVALID]: bad signature"));
+    assert.ok(compiled.promptText.includes("at verify (src/auth.ts:42:9)"));
+
+    // Tier 2: indented 150-char file must preserve entire body including trailing return statement
+    assert.ok(compiled.promptText.includes("const retries = 3;"));
+    assert.ok(compiled.promptText.includes("const timeoutMs = 1500;"));
+    assert.ok(
+      compiled.promptText.includes("return { retries, timeoutMs, strict };"),
+      `Tier 2 must preserve trailing lines of indented file:\n${compiled.promptText}`,
+    );
+    store.close();
+  });
+
+  it("42. [NB1] keeps test filenames containing 'error' in headers so real Error diagnostics are never displaced", () => {
+    const output = [
+      "FAIL src/error-handler.test.ts > retries transient gateway failure",
+      "  Error [ERR_UPSTREAM_TIMEOUT]: upstream server timed out after 5000ms",
+      "    at callUpstream (src/client.ts:88:11)",
+      "    at runTask (node_modules/vitest/dist/runner.js:120:4)",
+    ].join("\n");
+
+    const tight = compactCommandExcerpt(output, false, 130);
+    assert.ok(tight.length <= 130, `Expected <= 130, got ${tight.length}`);
+    assert.ok(
+      tight.includes("ERR_UPSTREAM_TIMEOUT"),
+      `Real diagnostic must never be displaced by error-handler.test.ts header:\n${tight}`,
+    );
+    assert.ok(
+      tight.includes("src/client.ts:88:11"),
+      `App stack frame must be preserved:\n${tight}`,
+    );
+  });
+});

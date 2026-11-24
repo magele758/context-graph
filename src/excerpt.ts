@@ -4,15 +4,15 @@
  *
  * Pure zero-dependency helpers designed to avoid character-level 50/50
  * head/tail slicing that corrupts identifiers, numeric literals, line numbers,
- * and source stack frames.
+ * and source stack frames, while maintaining strictly linear O(N) scanning.
  */
 
 const PRUNED_LINE_RE =
-  /^[ \t]*(?:\u2026|\.{3})?[ \t]*\[(?:pruned|truncated)\b[^\]]*\][ \t]*$/gim;
+  /^[ \t]*(?:(?:\u2026|\.{3})[ \t]*)?\[(?:pruned|truncated)\b[^\]\[\n]*\][ \t]*$/gim;
 const PRUNED_INLINE_RE =
-  /[ \t]*(?:\u2026|\.{3})?[ \t]*\[(?:pruned|truncated)\b[^\]]*\][ \t]*/gi;
+  /(?:(?:\u2026|\.{3})[ \t]*)?\[(?:pruned|truncated)\b[^\]\[\n]*\]/gi;
 const HEAD_TAIL_TAG_RE =
-  /[ \t]*\[[^\]]*head\/tail\s+shown[^\]]*\][ \t]*/gi;
+  /\[[^\]\[\n]*head\/tail[ \t]+shown[^\]\[\n]*\]/gi;
 
 const BOILERPLATE_ACK_LINE_RE =
   /^(?:successfully\s+)?(?:edited|updated|wrote|written|created|patched|modified|saved|applied\s+patch(?:\s+to)?|file\s+(?:updated|edited|written|saved))\b[^\n]*$/i;
@@ -27,10 +27,10 @@ const FAIL_HEADER_RE =
   /^(?:FAIL\b|FAILED\b|---\s*FAIL:|not\s+ok\s+\d|[\u2715\u2717\u2716\u00d7\u25cf\u276f]\s+\S|FAIL\s+\S)/;
 
 const ERROR_DIAG_RE =
-  /(?:\b(?:AssertionError|TypeError|SyntaxError|ReferenceError|RangeError|URIError|EvalError|AggregateError|Error)\b|\bERR_[A-Z0-9_]+\b|\bE(?:CONNREFUSED|CONNRESET|TIMEDOUT|NOENT|ACCES|ADDRINUSE|PIPE|PERM|EXIST|NOTDIR|ISDIR)\b|^(?:Expected|Received|Actual|Diff|Message|Cause|panic|Traceback|Exception|Assertion\s+failed)\s*[:(]|\berror\s+TS\d+:|\berror\[E\d+\]:)/i;
+  /(?:\b(?:AssertionError|TypeError|SyntaxError|ReferenceError|RangeError|URIError|EvalError|AggregateError)\b|\b[A-Z][A-Za-z0-9]*Error\b(?:\s*[:[(]|$)|\bError\s*[:[(]|\b(?:error|fatal)\s*:|\bERR_[A-Z0-9_]+\b|\bE(?:CONNREFUSED|CONNRESET|TIMEDOUT|NOENT|ACCES|ADDRINUSE|PIPE|PERM|EXIST|NOTDIR|ISDIR)\b|^(?:Expected|Received|Actual|Diff|Message|Cause|panic|Traceback|Exception|Assertion\s+failed)\s*[:(]|\berror\s+TS\d+:|\berror\[E\d+\]:)/;
 
 const APP_STACK_FRAME_RE =
-  /(?:^\s*at\s+.*(?::\d+(?::\d+)?\)?$)|^\s*File\s+"[^"]+",\s+line\s+\d+|(?:\b(?:src|packages|apps|lib|server|client|api|cmd|pkg|internal|tests?|spec|bin)\/[^\s):'"]+\.\w+:\d+(?::\d+)?)|\([^\s)]+\.\w+:\d+(?::\d+)?\))/i;
+  /(?:^\s*at\s+.*(?::\d+(?::\d+)?\)?$)|^\s*File\s+"[^"\n]+",\s+line\s+\d+|(?:^|[\s('"])(?:src|packages|apps|lib|server|client|api|cmd|pkg|internal|tests?|spec|bin)\/[^\s():'"\n]+\.\w+:\d+(?::\d+)?|\([^\s()\n]+\.\w+:\d+(?::\d+)?\))/i;
 
 const PASS_SUMMARY_RE =
   /(?:\b\d+\s+(?:passed|passing|tests?\s+passed|specs?\s+passed|succeeded)\b|\bpass\s+\d+|\bPASS\b|\ball\s+\d+.*pass|\b0\s+errors?\b|\bbuild\s+succeeded\b|\bcompiled\s+successfully\b|^ok\s+\S+)/i;
@@ -44,7 +44,7 @@ const TOP_LEVEL_DECL_RE =
   /^(?:export\s+(?:default\s+)?)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:const|let|var|type|interface|class|function|enum)\b/;
 
 const MULTILANG_DECL_RE =
-  /^(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:def|class|struct|enum|trait|impl|fn|func|type|const|static|let)\b/;
+  /^(?:pub(?:\([^)\n]*\))?\s+)?(?:async\s+)?(?:def|class|struct|enum|trait|impl|fn|func|type|const|static|let)\b/;
 
 const ENV_OR_INI_KEY_RE =
   /^(?:[A-Z][A-Z0-9_.-]*\s*[:=]|\[[A-Za-z0-9_.-]+\]$)/;
@@ -57,40 +57,95 @@ const NON_KV_CONTROL_RE = /^(?:case\b|default\s*:|https?:)/i;
 const LINE_NUMBER_GUTTER_RE = /^\s*\d+\s*(?:\||->|\u2192|\t|:\s)/;
 
 /**
+ * Strictly O(N) backward scan trimming trailing horizontal whitespace (` ` / `\t`),
+ * avoiding quadratic regex backtracking on long space-prefixed lines.
+ */
+export function trimHorizontalEnd(line: string): string {
+  let end = line.length;
+  while (end > 0) {
+    const ch = line.charCodeAt(end - 1);
+    if (ch === 32 || ch === 9) {
+      end--;
+    } else {
+      break;
+    }
+  }
+  return end === line.length ? line : line.slice(0, end);
+}
+
+/**
+ * Strictly linear O(N) marker removal with clean adjacent horizontal-space
+ * collapse. Expects `re` to have the global flag and NO unanchored leading
+ * whitespace quantifier.
+ */
+export function stripRegexLinear(text: string, re: RegExp): string {
+  re.lastIndex = 0;
+  let match = re.exec(text);
+  if (!match) return text;
+
+  let out = "";
+  let cursor = 0;
+  const len = text.length;
+
+  while (match) {
+    const start = match.index;
+    const end = start + match[0]!.length;
+
+    // Expand left over horizontal spaces back to cursor
+    let l = start;
+    while (l > cursor) {
+      const ch = text.charCodeAt(l - 1);
+      if (ch === 32 || ch === 9) l--;
+      else break;
+    }
+
+    // Expand right over horizontal spaces
+    let r = end;
+    while (r < len) {
+      const ch = text.charCodeAt(r);
+      if (ch === 32 || ch === 9) r++;
+      else break;
+    }
+
+    out += text.slice(cursor, l);
+
+    const hasLeftNonNewline = l > 0 && text.charCodeAt(l - 1) !== 10;
+    const hasRightNonNewline = r < len && text.charCodeAt(r) !== 10;
+    if (hasLeftNonNewline && hasRightNonNewline) {
+      out += " ";
+    }
+
+    cursor = r;
+    if (re.lastIndex < r) {
+      re.lastIndex = r;
+    }
+    if (end === start) {
+      re.lastIndex = start + 1;
+    }
+    match = re.exec(text);
+  }
+
+  out += text.slice(cursor);
+  return out;
+}
+
+/**
  * Strips upstream truncation / pruning markers (e.g. `[pruned 1234 chars; head/tail shown]`)
- * and normalizes line endings & whitespace without destroying code indentation.
+ * and normalizes line endings & whitespace in strictly linear O(N) time without
+ * destroying code indentation.
  */
 export function sanitizeNeutralText(text: string): string {
   if (!text) return "";
   let s = text.replace(/\r\n?/g, "\n");
   // Drop standalone marker lines completely
   s = s.replace(PRUNED_LINE_RE, "");
-  // Drop inline markers, preserving a single space only when flanked by non-whitespace
-  s = s.replace(PRUNED_INLINE_RE, (match, offset: number, full: string) => {
-    const before = offset > 0 ? full[offset - 1]! : "";
-    const afterIdx = offset + match.length;
-    const after = afterIdx < full.length ? full[afterIdx]! : "";
-    if (before && after && !/\s/.test(before) && !/\s/.test(after)) {
-      return " ";
-    }
-    if (before && after && !/\n/.test(before) && !/\n/.test(after) && /\s/.test(match)) {
-      return " ";
-    }
-    return "";
-  });
-  s = s.replace(HEAD_TAIL_TAG_RE, (match, offset: number, full: string) => {
-    const before = offset > 0 ? full[offset - 1]! : "";
-    const afterIdx = offset + match.length;
-    const after = afterIdx < full.length ? full[afterIdx]! : "";
-    if (before && after && !/\s/.test(before) && !/\s/.test(after)) {
-      return " ";
-    }
-    return "";
-  });
-  // Trim trailing horizontal spaces per line and collapse excessive blank runs
+  // Drop inline markers & collapse directly adjacent horizontal spaces linearly
+  s = stripRegexLinear(s, PRUNED_INLINE_RE);
+  s = stripRegexLinear(s, HEAD_TAIL_TAG_RE);
+  // Trim trailing horizontal spaces per line in O(N) and collapse excessive blank runs
   s = s
     .split("\n")
-    .map((line) => line.replace(/[ \t]+$/g, ""))
+    .map((line) => trimHorizontalEnd(line))
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
@@ -103,17 +158,18 @@ export function sanitizeNeutralText(text: string): string {
  * newline, or safe punctuation boundary before appending ` ...`.
  */
 export function truncateAtWordBoundary(text: string, maxChars: number): string {
-  if (maxChars <= 0) return "";
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
+  const cap = Math.floor(maxChars);
   const s = text.trim();
-  if (s.length <= maxChars) return s;
+  if (s.length <= cap) return s;
 
-  if (maxChars < 4) {
-    return s.slice(0, maxChars);
+  if (cap < 4) {
+    return s.slice(0, cap);
   }
-  const suffix = maxChars >= 8 ? " ..." : "...";
-  const limit = maxChars - suffix.length;
+  const suffix = cap >= 8 ? " ..." : "...";
+  const limit = cap - suffix.length;
   if (limit <= 0) {
-    return s.slice(0, maxChars);
+    return s.slice(0, cap);
   }
 
   for (let k = limit; k >= 1; k--) {
@@ -235,7 +291,7 @@ function stripBoilerplateAcks(text: string): string {
     const trimmed = line.trim();
     if (!trimmed) continue;
     if (BOILERPLATE_ACK_LINE_RE.test(trimmed)) continue;
-    kept.push(line.replace(/[ \t]+$/g, ""));
+    kept.push(trimHorizontalEnd(line));
   }
   return kept.join("\n").trim();
 }
@@ -252,24 +308,25 @@ export function compactCodeExcerpt(
   maxChars: number,
   opts?: { diffText?: string },
 ): string {
-  if (maxChars <= 0) return "";
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
+  const cap = Math.floor(maxChars);
 
   if (opts?.diffText && opts.diffText.trim().length > 0) {
     const cleanDiff = stripBoilerplateAcks(sanitizeNeutralText(opts.diffText));
     if (cleanDiff.length > 0) {
-      return packLinesSequentially(cleanDiff.split("\n"), maxChars);
+      return packLinesSequentially(cleanDiff.split("\n"), cap);
     }
   }
 
   const clean = sanitizeNeutralText(content);
   if (!clean) return "";
-  if (clean.length <= maxChars) {
+  if (clean.length <= cap) {
     return clean;
   }
 
   const rawLines = clean
     .split("\n")
-    .map((l) => l.replace(/[ \t]+$/g, ""))
+    .map((l) => trimHorizontalEnd(l))
     .filter((l) => l.trim().length > 0);
   if (rawLines.length === 0) return "";
 
@@ -287,7 +344,7 @@ export function compactCodeExcerpt(
   const tryAdd = (idx: number, text: string, allowTruncateSingleLine: boolean): boolean => {
     if (selected.has(idx)) return false;
     const sepLen = selected.size > 0 ? 1 : 0;
-    const remaining = maxChars - usedChars - sepLen;
+    const remaining = cap - usedChars - sepLen;
     if (remaining <= 0) return false;
     if (text.length <= remaining) {
       selected.set(idx, text);
@@ -307,7 +364,7 @@ export function compactCodeExcerpt(
 
   // P0: at most 1 leading module header comment (only if budget leaves ample room for declarations)
   const p0 = classified.filter((c) => c.priority === 0);
-  if (p0.length > 0 && p0[0]!.text.length <= Math.floor(maxChars * 0.35)) {
+  if (p0.length > 0 && p0[0]!.text.length <= Math.floor(cap * 0.35)) {
     tryAdd(p0[0]!.idx, p0[0]!.text, false);
   }
 
@@ -315,8 +372,7 @@ export function compactCodeExcerpt(
   const p1 = classified.filter((c) => c.priority === 1);
   for (const item of p1) {
     if (!tryAdd(item.idx, item.text, selected.size === 0)) {
-      // If a long declaration didn't fit whole, allow clean word-boundary truncation when enough room exists
-      if (maxChars - usedChars >= 48) {
+      if (cap - usedChars >= 48) {
         tryAdd(item.idx, item.text, true);
       }
     }
@@ -325,21 +381,21 @@ export function compactCodeExcerpt(
   // P2: meaningful head/body lines in source order
   const p2 = classified.filter((c) => c.priority === 2);
   for (const item of p2) {
-    if (maxChars - usedChars < 16) break;
-    if (!tryAdd(item.idx, item.text, selected.size === 0 || maxChars - usedChars >= 48)) {
-      if (maxChars - usedChars < 48) break;
+    if (cap - usedChars < 16) break;
+    if (!tryAdd(item.idx, item.text, selected.size === 0 || cap - usedChars >= 48)) {
+      if (cap - usedChars < 48) break;
     }
   }
 
   // P3: imports only if space still remains
   const p3 = classified.filter((c) => c.priority === 3);
   for (const item of p3) {
-    if (maxChars - usedChars < 24) break;
+    if (cap - usedChars < 24) break;
     tryAdd(item.idx, item.text, false);
   }
 
   if (selected.size === 0) {
-    return truncateAtWordBoundary(classified[0]!.text, maxChars);
+    return truncateAtWordBoundary(classified[0]!.text, cap);
   }
 
   // Emit in original source line order
@@ -348,11 +404,11 @@ export function compactCodeExcerpt(
     .map(([, text]) => text);
 
   const joined = ordered.join("\n");
-  return joined.length <= maxChars ? joined : truncateAtWordBoundary(joined, maxChars);
+  return joined.length <= cap ? joined : truncateAtWordBoundary(joined, cap);
 }
 
 function packLinesSequentially(lines: readonly string[], maxChars: number): string {
-  const nonEmpty = lines.map((l) => l.replace(/[ \t]+$/g, "")).filter((l) => l.trim().length > 0);
+  const nonEmpty = lines.map((l) => trimHorizontalEnd(l)).filter((l) => l.trim().length > 0);
   if (nonEmpty.length === 0) return "";
   const full = nonEmpty.join("\n");
   if (full.length <= maxChars) return full;
@@ -398,7 +454,8 @@ export function compactCommandExcerpt(
   ok: boolean,
   maxChars: number,
 ): string {
-  if (maxChars <= 0) return "";
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
+  const cap = Math.floor(maxChars);
   const clean = sanitizeNeutralText(output);
   if (!clean) return "";
 
@@ -409,17 +466,17 @@ export function compactCommandExcerpt(
   if (allLines.length === 0) return "";
 
   if (ok) {
-    const cap = Math.min(maxChars, 120);
+    const passCap = Math.min(cap, 120);
     // Prefer an explicit pass/summary line (often near the bottom of test runner output)
     const passMatches = allLines.filter(
       (l) => !VENDOR_STACK_FRAME_RE.test(l) && PASS_SUMMARY_RE.test(l),
     );
     if (passMatches.length > 0) {
-      return truncateAtWordBoundary(passMatches[passMatches.length - 1]!, cap);
+      return truncateAtWordBoundary(passMatches[passMatches.length - 1]!, passCap);
     }
     const meaningful = allLines.filter((l) => !/^>\s+/.test(l) && !VENDOR_STACK_FRAME_RE.test(l));
     const chosen = meaningful[0] ?? allLines[0]!;
-    return truncateAtWordBoundary(chosen, cap);
+    return truncateAtWordBoundary(chosen, passCap);
   }
 
   // Failure path: drop noisy vendor/runtime stack frames first
@@ -433,14 +490,16 @@ export function compactCommandExcerpt(
 
   for (const line of workingLines) {
     const isRedundantSummary = REDUNDANT_CMD_SUMMARY_RE.test(line);
-    const isExplicitStackLine = /^\s*(?:at\s+\S|File\s+"[^"]+",\s+line\s+\d+)/.test(line);
+    const isExplicitStackLine = /^\s*(?:at\s+\S|File\s+"[^"\n]+",\s+line\s+\d+)/.test(line);
     const isHeader = FAIL_HEADER_RE.test(line) && !isRedundantSummary;
     const isFrame = APP_STACK_FRAME_RE.test(line) && !isRedundantSummary;
     const isDiag = ERROR_DIAG_RE.test(line) && !isRedundantSummary;
 
     if (isExplicitStackLine && isFrame) {
       appFrames.push(line);
-    } else if (isHeader && !isDiag) {
+    } else if (isHeader) {
+      // Check test/suite headers BEFORE diagnostics so test filenames like
+      // `FAIL src/error-handler.test.ts` never displace real Error diagnostics.
       headers.push(line);
       if (isFrame && /\.\w+:\d+/.test(line)) {
         appFrames.push(line);
@@ -463,7 +522,7 @@ export function compactCommandExcerpt(
   // If no structured failure signals were found, fall back cleanly to non-summary lines
   if (!primaryHeader && !primaryDiag && !primaryFrame) {
     const pool = fallback.length > 0 ? fallback : workingLines;
-    return packLinesSequentially(pool, maxChars);
+    return packLinesSequentially(pool, cap);
   }
 
   // Build priority-ordered bundle guaranteeing diagnostic + app source frame are never starved
@@ -477,22 +536,23 @@ export function compactCommandExcerpt(
   const joinParts = (parts: readonly string[]) => parts.join("\n");
   const essentialTexts = essential.map((e) => e.text);
 
-  if (joinParts(essentialTexts).length <= maxChars) {
+  if (joinParts(essentialTexts).length <= cap) {
     // Everything essential fits! Greedily include secondary diagnostics (e.g. Expected / Received)
     const chosen: string[] = [];
     if (primaryHeader) chosen.push(primaryHeader);
     if (primaryDiag) chosen.push(primaryDiag);
 
-    const frameReserve = primaryFrame && primaryFrame !== primaryDiag && primaryFrame !== primaryHeader
-      ? primaryFrame.length + 1
-      : 0;
+    const frameReserve =
+      primaryFrame && primaryFrame !== primaryDiag && primaryFrame !== primaryHeader
+        ? primaryFrame.length + 1
+        : 0;
     let currentLen = joinParts(chosen).length;
 
     for (let i = 1; i < diagnostics.length && i < 4; i++) {
       const extra = diagnostics[i]!;
       if (chosen.includes(extra) || extra === primaryFrame) continue;
       const nextLen = currentLen + (chosen.length > 0 ? 1 : 0) + extra.length;
-      if (nextLen + frameReserve <= maxChars) {
+      if (nextLen + frameReserve <= cap) {
         chosen.push(extra);
         currentLen = nextLen;
       }
@@ -511,20 +571,20 @@ export function compactCommandExcerpt(
 
   if (primaryHeader && coreWithoutHeader.length > 0) {
     const coreLen = joinParts(coreWithoutHeader).length;
-    const remForHeader = maxChars - coreLen - 1;
+    const remForHeader = cap - coreLen - 1;
     if (remForHeader >= 28) {
       const shortHeader = truncateAtWordBoundary(primaryHeader, remForHeader);
       return joinParts([shortHeader, ...coreWithoutHeader]);
     }
-    if (coreLen <= maxChars) {
+    if (coreLen <= cap) {
       return joinParts(coreWithoutHeader);
     }
   }
 
-  // Even coreWithoutHeader exceeds maxChars: split cleanly between diag and frame at word boundaries
+  // Even coreWithoutHeader exceeds cap: split cleanly between diag and frame at word boundaries
   if (primaryDiag && primaryFrame && primaryFrame !== primaryDiag) {
-    const frameBudget = Math.min(primaryFrame.length, Math.max(36, Math.floor(maxChars * 0.4)));
-    const diagBudget = maxChars - frameBudget - 1;
+    const frameBudget = Math.min(primaryFrame.length, Math.max(36, Math.floor(cap * 0.4)));
+    const diagBudget = cap - frameBudget - 1;
     if (diagBudget >= 24) {
       return joinParts([
         truncateAtWordBoundary(primaryDiag, diagBudget),
@@ -534,5 +594,5 @@ export function compactCommandExcerpt(
   }
 
   const single = primaryDiag ?? primaryFrame ?? primaryHeader ?? workingLines[0]!;
-  return truncateAtWordBoundary(single, maxChars);
+  return truncateAtWordBoundary(single, cap);
 }
