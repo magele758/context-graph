@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { after, before, describe, it } from "node:test";
+import { gzipSync } from "node:zlib";
 import {
   classifyToolEvent,
   extractEditPairs,
@@ -4130,6 +4131,396 @@ describe("v0.2.5 Single-Transaction Batching & Atomic autoCreate Suite", () => {
     } finally {
       store?.close();
       rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("v0.2.6 Wire Efficiency Suite (Zip-Bomb-Safe Gzip & Slim Response Mode)", () => {
+  it("65. decodes Content-Encoding: gzip safely, rejects corrupt/unsupported encodings, and blocks zip bombs with 413", async () => {
+    const token = "cg_v26_gzip_wire_bearer_secret";
+    const app = createContextGraphServer({ dataPath: ":memory:", port: 0, authToken: token });
+    const bound = await app.start(0, "127.0.0.1");
+
+    const payloadObj = {
+      autoCreate: true,
+      graphName: "Gzip Wire Session",
+      prune: true,
+      compile: true,
+      compileOptions: { format: "compact_markdown", maxOutputChars: 720 },
+      events: [
+        {
+          callId: "gz_r1",
+          tool: "read_file",
+          args: { path: "src/transport/codec.ts" },
+          ok: true,
+          output:
+            "export const FRAME_LIMIT = 4096;\nexport const CODEC_MODE = 'framed';\n" +
+            Array.from({ length: 120 }, (_, i) => `const pad_${i} = ${i};`).join("\n"),
+        },
+        {
+          callId: "gz_e1",
+          tool: "edit_file",
+          args: {
+            path: "src/transport/codec.ts",
+            old_string: "export const FRAME_LIMIT = 4096;",
+            new_string: "export const FRAME_LIMIT = 8192;",
+          },
+          ok: true,
+          output: "Edited src/transport/codec.ts",
+        },
+      ],
+    };
+
+    try {
+      // 1. Valid gzip request decodes transparently (200)
+      const jsonStr = JSON.stringify(payloadObj);
+      const gzBody = gzipSync(Buffer.from(jsonStr, "utf8"));
+      assert.ok(gzBody.length < jsonStr.length * 0.5, "Gzip body should compress substantially");
+
+      const okGz = await fetch(`${bound.url}/v1/graphs/gzip_sess_1/ingest-artifacts`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          "Content-Encoding": "gzip",
+        },
+        body: new Uint8Array(gzBody),
+      });
+      assert.equal(okGz.status, 200);
+      const okJson = (await okGz.json()) as {
+        ok: boolean;
+        ingested: { ingestedCount: number };
+        compiled?: { promptText: string };
+      };
+      assert.equal(okJson.ok, true);
+      assert.equal(okJson.ingested.ingestedCount, 2);
+      assert.ok(okJson.compiled?.promptText.includes("FRAME_LIMIT = 8192"));
+      assert.ok(!okJson.compiled?.promptText.includes("FRAME_LIMIT = 4096"));
+
+      // 2. Plain uncompressed & Content-Encoding: identity stay 100% unchanged
+      const okIdentity = await fetch(`${bound.url}/v1/graphs/gzip_sess_1/ingest-artifacts`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          "Content-Encoding": "identity",
+        },
+        body: jsonStr,
+      });
+      assert.equal(okIdentity.status, 200);
+
+      // 3. Corrupted gzip payload -> 400 INVALID_GZIP
+      const badGz = await fetch(`${bound.url}/v1/graphs/gzip_sess_1/ingest-artifacts`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          "Content-Encoding": "gzip",
+        },
+        body: new Uint8Array(Buffer.from("not-valid-gzip-bytes-at-all")),
+      });
+      assert.equal(badGz.status, 400);
+      const badGzJson = (await badGz.json()) as { error: { code: string } };
+      assert.equal(badGzJson.error.code, "INVALID_GZIP");
+
+      // Empty body with Content-Encoding: gzip -> 400 INVALID_GZIP
+      const emptyGz = await fetch(`${bound.url}/v1/graphs/gzip_sess_1/ingest-artifacts`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          "Content-Encoding": "gzip",
+        },
+        body: new Uint8Array(0),
+      });
+      assert.equal(emptyGz.status, 400);
+      const emptyGzJson = (await emptyGz.json()) as { error: { code: string } };
+      assert.equal(emptyGzJson.error.code, "INVALID_GZIP");
+
+      // 4. Unsupported Content-Encoding (`br`, stacked `gzip, gzip`) -> 415 UNSUPPORTED_MEDIA_TYPE
+      for (const badEnc of ["br", "deflate", "gzip, gzip"]) {
+        const unsupRes = await fetch(`${bound.url}/v1/graphs/gzip_sess_1/ingest-artifacts`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+            "Content-Encoding": badEnc,
+          },
+          body: new Uint8Array(gzBody),
+        });
+        assert.equal(unsupRes.status, 415, `Expected 415 for Content-Encoding: ${badEnc}`);
+        const unsupJson = (await unsupRes.json()) as { error: { code: string } };
+        assert.equal(unsupJson.error.code, "UNSUPPORTED_MEDIA_TYPE");
+      }
+
+      // 5. Zip-bomb protection: ~3 KB compressed expanding to 3 MiB (> 2 MiB MAX_BODY_BYTES) -> 413 PAYLOAD_TOO_LARGE
+      const zipBomb = gzipSync(Buffer.alloc(3 * 1024 * 1024, 65));
+      assert.ok(zipBomb.length < 16_384, `Expected small compressed zip bomb, got ${zipBomb.length}B`);
+
+      const bombRes = await fetch(`${bound.url}/v1/graphs/gzip_sess_1/ingest-artifacts`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          "Content-Encoding": "gzip",
+        },
+        body: new Uint8Array(zipBomb),
+      });
+      assert.equal(bombRes.status, 413);
+      const bombJson = (await bombRes.json()) as { error: { code: string } };
+      assert.equal(bombJson.error.code, "PAYLOAD_TOO_LARGE");
+
+      // Server remains healthy after rejecting zip bomb
+      const healthRes = await fetch(`${bound.url}/health`);
+      assert.equal(healthRes.status, 200);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("66. responseMode='slim' returns only changed pruned events + slim compiled/summary, shrinks payload >75%, and validates enum", async () => {
+    const token = "cg_v26_slim_mode_bearer_secret";
+    const app = createContextGraphServer({ dataPath: ":memory:", port: 0, authToken: token });
+    const bound = await app.start(0, "127.0.0.1");
+    const authHeaders = {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    };
+
+    const bigFiller = (tag: string) =>
+      `export const TAG_${tag} = '${tag}';\n` +
+      Array.from({ length: 120 }, (_, i) => `export const ROW_${tag}_${i} = "${tag}_${"v".repeat(36)}_${i}";`).join("\n");
+
+    const bulkyEvents: ToolTrajectoryEvent[] = [
+      {
+        callId: "ev_ro_1",
+        tool: "read_file",
+        args: { path: "src/docs/manual_a.ts" },
+        ok: true,
+        output: bigFiller("A"),
+      },
+      {
+        callId: "ev_ro_2",
+        tool: "read_file",
+        args: { path: "src/docs/manual_b.ts" },
+        ok: true,
+        output: bigFiller("B"),
+      },
+      {
+        callId: "ev_ro_3",
+        tool: "read_file",
+        args: { path: "src/docs/manual_c.ts" },
+        ok: true,
+        output: bigFiller("C"),
+      },
+      {
+        callId: "ev_ro_4",
+        tool: "read_file",
+        args: { path: "src/docs/manual_d.ts" },
+        ok: true,
+        output: bigFiller("D"),
+      },
+      {
+        callId: "ev_stale_read",
+        tool: "read_file",
+        args: { path: "src/engine/worker.ts" },
+        ok: true,
+        output: "export const MAX_JOBS = 10;\n" + bigFiller("OLD"),
+      },
+      {
+        callId: "ev_fresh_write",
+        tool: "write_file",
+        args: {
+          path: "src/engine/worker.ts",
+          content: "export const MAX_JOBS = 25;\n" + bigFiller("NEW"),
+        },
+        ok: true,
+        output: "Wrote src/engine/worker.ts",
+      },
+      {
+        callId: "ev_noisy_fail",
+        tool: "bash",
+        args: { command: "npm test" },
+        ok: false,
+        output: [
+          "FAIL src/engine/worker.test.ts > respects job cap",
+          "  Error [ERR_JOB_STALLED]: queue stalled at 25",
+          "    at runJob (src/engine/worker.ts:42:7)",
+          ...Array.from(
+            { length: 15 },
+            (_, i) => `    at step${i} (node_modules/vitest/dist/runner.js:${100 + i}:12)`,
+          ),
+          "    at processTicks (node:internal/process/task_queues:95:5)",
+        ].join("\n"),
+      },
+    ];
+
+    try {
+      // 1. Invalid responseMode -> 400 VALIDATION_ERROR
+      const badRes = await fetch(`${bound.url}/v1/graphs/g_bad_mode/ingest-artifacts`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          autoCreate: true,
+          responseMode: "tiny",
+          events: [bulkyEvents[0]!],
+        }),
+      });
+      assert.equal(badRes.status, 400);
+      const badJson = (await badRes.json()) as { error: { code: string } };
+      assert.equal(badJson.error.code, "VALIDATION_ERROR");
+
+      // 2. Full response (default)
+      const fullRes = await fetch(`${bound.url}/v1/graphs/g_wire_full/ingest-artifacts`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          autoCreate: true,
+          responseMode: "full",
+          prune: true,
+          compile: true,
+          compileOptions: { format: "compact_markdown", maxOutputChars: 720 },
+          events: bulkyEvents,
+        }),
+      });
+      assert.equal(fullRes.status, 200);
+      const fullText = await fullRes.text();
+      const fullBody = JSON.parse(fullText) as {
+        ok: boolean;
+        ingested: { ingestedCount: number; skippedCount: number; addedNodes: unknown[] };
+        pruned: {
+          events: Array<{ callId: string; pruned: boolean; output: string }>;
+          prunedCallIds: string[];
+          prunedCount: number;
+          charsSaved: number;
+          tokensSaved: number;
+        };
+        compiled: { promptText: string; zone2Nodes: unknown[] };
+      };
+      assert.equal(fullBody.ingested.addedNodes.length, 7);
+      assert.equal(fullBody.pruned.events.length, 7);
+
+      // 3. Slim response
+      const slimRes = await fetch(`${bound.url}/v1/graphs/g_wire_slim/ingest-artifacts`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          autoCreate: true,
+          responseMode: "slim",
+          prune: true,
+          compile: true,
+          compileOptions: { format: "compact_markdown", maxOutputChars: 720 },
+          events: bulkyEvents,
+        }),
+      });
+      assert.equal(slimRes.status, 200);
+      const slimText = await slimRes.text();
+      const slimBody = JSON.parse(slimText) as {
+        ok: boolean;
+        graphId: string;
+        ingested?: unknown;
+        ingestedSummary: { ingestedCount: number; skippedCount: number };
+        pruned: {
+          events: Array<{ callId: string; pruned: boolean; output: string }>;
+          prunedCallIds: string[];
+          prunedCount: number;
+          charsSaved: number;
+          tokensSaved: number;
+        };
+        compiled: {
+          promptText: string;
+          format: string;
+          totalTokens: number;
+          budgetTokens: number;
+          zone1Nodes?: unknown;
+          zone2Nodes?: unknown;
+          excludedNodes?: unknown;
+          messages?: unknown;
+        };
+      };
+
+      assert.equal(slimBody.ok, true);
+      assert.equal(slimBody.ingested, undefined, "Slim mode must omit bulky ingested node arrays");
+      assert.deepEqual(slimBody.ingestedSummary, {
+        ingestedCount: fullBody.ingested.ingestedCount,
+        skippedCount: fullBody.ingested.skippedCount,
+      });
+
+      // Pruned keeps ONLY changed events: superseded read_file + vendor-stripped active bash command!
+      const slimCallIds = slimBody.pruned.events.map((e) => e.callId);
+      assert.deepEqual(slimCallIds, ["ev_stale_read", "ev_noisy_fail"]);
+      assert.equal(slimBody.pruned.events[0]!.pruned, true);
+      assert.equal(slimBody.pruned.events[1]!.pruned, false);
+      assert.ok(slimBody.pruned.events[1]!.output.includes("ERR_JOB_STALLED"));
+      assert.ok(!slimBody.pruned.events[1]!.output.includes("node_modules/"));
+
+      // Exact pruning accounting matches full mode
+      assert.deepEqual(slimBody.pruned.prunedCallIds, fullBody.pruned.prunedCallIds);
+      assert.equal(slimBody.pruned.prunedCount, fullBody.pruned.prunedCount);
+      assert.equal(slimBody.pruned.charsSaved, fullBody.pruned.charsSaved);
+      assert.equal(slimBody.pruned.tokensSaved, fullBody.pruned.tokensSaved);
+
+      // Compiled keeps exact promptText + compact stats while omitting bulky arrays
+      assert.equal(slimBody.compiled.promptText, fullBody.compiled.promptText);
+      assert.equal(slimBody.compiled.format, "compact_markdown");
+      assert.ok(slimBody.compiled.totalTokens > 0);
+      assert.ok(slimBody.compiled.budgetTokens > 0);
+      assert.equal(slimBody.compiled.zone1Nodes, undefined);
+      assert.equal(slimBody.compiled.zone2Nodes, undefined);
+      assert.equal(slimBody.compiled.excludedNodes, undefined);
+      assert.equal(slimBody.compiled.messages, undefined);
+
+      // Dramatic wire payload reduction (< 25% of full!)
+      const fullBytes = Buffer.byteLength(fullText, "utf8");
+      const slimBytes = Buffer.byteLength(slimText, "utf8");
+      assert.ok(
+        slimBytes < fullBytes * 0.25,
+        `Expected slim response (${slimBytes}B) < 25% of full (${fullBytes}B)`,
+      );
+
+      // 4. MCP cg_ingest_artifacts also supports responseMode: 'slim'
+      const mcpSlimRes = await fetch(`${bound.url}/mcp`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 106,
+          method: "tools/call",
+          params: {
+            name: "cg_ingest_artifacts",
+            arguments: {
+              graphId: "g_mcp_slim",
+              autoCreate: true,
+              responseMode: "slim",
+              prune: true,
+              compile: true,
+              compileOptions: { format: "compact_markdown", maxOutputChars: 720 },
+              events: bulkyEvents,
+            },
+          },
+        }),
+      });
+      assert.equal(mcpSlimRes.status, 200);
+      const mcpSlimBody = (await mcpSlimRes.json()) as {
+        result: { isError?: boolean; content: Array<{ text: string }> };
+      };
+      assert.equal(mcpSlimBody.result.isError, false);
+      const parsedMcpSlim = JSON.parse(mcpSlimBody.result.content[0]!.text) as {
+        ingested?: unknown;
+        ingestedSummary: { ingestedCount: number };
+        pruned: { events: Array<{ callId: string }> };
+        compiled: { promptText: string; zone2Nodes?: unknown };
+      };
+      assert.equal(parsedMcpSlim.ingested, undefined);
+      assert.equal(parsedMcpSlim.ingestedSummary.ingestedCount, 7);
+      assert.deepEqual(
+        parsedMcpSlim.pruned.events.map((e) => e.callId),
+        ["ev_stale_read", "ev_noisy_fail"],
+      );
+      assert.equal(parsedMcpSlim.compiled.zone2Nodes, undefined);
+      assert.equal(parsedMcpSlim.compiled.promptText, fullBody.compiled.promptText);
+    } finally {
+      await app.close();
     }
   });
 });

@@ -397,6 +397,8 @@ export interface PruneTrajectoryResult {
   tokensSaved: number;
 }
 
+export type IngestResponseMode = "full" | "slim";
+
 export interface IngestArtifactsOptions {
   scope?: string;
   turn?: number;
@@ -405,6 +407,7 @@ export interface IngestArtifactsOptions {
   maxCommandExcerptChars?: number;
   autoCreate?: boolean;
   graphName?: string;
+  responseMode?: IngestResponseMode;
 }
 
 export interface IngestArtifactsResult {

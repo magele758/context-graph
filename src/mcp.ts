@@ -172,6 +172,7 @@ export const MCP_TOOLS = [
         maxCommandExcerptChars: { type: "integer" },
         autoCreate: { type: "boolean" },
         graphName: { type: "string" },
+        responseMode: { type: "string", enum: ["full", "slim"] },
         prune: { type: "boolean" },
         compile: { type: "boolean" },
         compileOptions: { type: "object" },
@@ -404,6 +405,40 @@ export class ContextGraphMcpSession {
                 graphId,
               })
             : undefined;
+        if (ingestOpts.responseMode === "slim") {
+          const slimPruned = pruned
+            ? {
+                ...pruned,
+                events: pruned.events.filter((ev, idx) => {
+                  const orig = events[idx];
+                  if (!orig) return true;
+                  return (
+                    ev.pruned === true ||
+                    ev.output !== orig.output ||
+                    ev.args !== orig.args
+                  );
+                }),
+              }
+            : undefined;
+          const slimCompiled = compiled
+            ? {
+                promptText: compiled.promptText,
+                format: validatedCompileOpts?.format ?? "both",
+                totalTokens: compiled.kvCache.totalTokens,
+                budgetTokens: compiled.maxTokens,
+              }
+            : undefined;
+          return {
+            ok: true,
+            graphId,
+            ingestedSummary: {
+              ingestedCount: ingested.ingestedCount,
+              skippedCount: ingested.skippedCount,
+            },
+            ...(slimPruned ? { pruned: slimPruned } : {}),
+            ...(slimCompiled ? { compiled: slimCompiled } : {}),
+          };
+        }
         return {
           ok: true,
           graphId,

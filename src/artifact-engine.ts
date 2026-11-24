@@ -217,6 +217,7 @@ export function validateIngestArtifactsOptions(
       : {}),
     ...(raw.autoCreate !== undefined ? { autoCreate: raw.autoCreate } : {}),
     ...(raw.graphName !== undefined ? { graphName: raw.graphName } : {}),
+    ...(raw.responseMode !== undefined ? { responseMode: raw.responseMode } : {}),
   };
 
   if (merged.scope !== undefined && typeof merged.scope !== "string") {
@@ -280,6 +281,18 @@ export function validateIngestArtifactsOptions(
     normalizedGraphName = trimmed;
   }
 
+  if (
+    merged.responseMode !== undefined &&
+    merged.responseMode !== "full" &&
+    merged.responseMode !== "slim"
+  ) {
+    throw new ContextGraphError(
+      "'responseMode' must be 'full' or 'slim'",
+      "VALIDATION_ERROR",
+      400,
+    );
+  }
+
   return {
     ...(merged.scope !== undefined ? { scope: merged.scope } : {}),
     ...(merged.turn !== undefined ? { turn: merged.turn } : {}),
@@ -292,6 +305,7 @@ export function validateIngestArtifactsOptions(
       : {}),
     ...(merged.autoCreate !== undefined ? { autoCreate: merged.autoCreate } : {}),
     ...(normalizedGraphName !== undefined ? { graphName: normalizedGraphName } : {}),
+    ...(merged.responseMode !== undefined ? { responseMode: merged.responseMode } : {}),
   };
 }
 

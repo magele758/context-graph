@@ -1,6 +1,7 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { gunzipSync } from "node:zlib";
 import {
   ingestToolArtifacts,
   pruneTrajectoryEvents,
@@ -115,7 +116,22 @@ function hasSuccessfulInitialize(
   return false;
 }
 
+function resolveContentEncoding(req: IncomingMessage): "identity" | "gzip" {
+  const raw = req.headers["content-encoding"];
+  if (raw === undefined) return "identity";
+  const joined = Array.isArray(raw) ? raw.join(",") : raw;
+  const trimmed = joined.trim().toLowerCase();
+  if (!trimmed || trimmed === "identity") return "identity";
+  if (trimmed === "gzip") return "gzip";
+  throw new ContextGraphError(
+    `Unsupported Content-Encoding '${joined.trim()}'`,
+    "UNSUPPORTED_MEDIA_TYPE",
+    415,
+  );
+}
+
 async function readRawBody(req: IncomingMessage): Promise<string> {
+  const encoding = resolveContentEncoding(req);
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of req) {
@@ -126,8 +142,33 @@ async function readRawBody(req: IncomingMessage): Promise<string> {
     }
     chunks.push(buf);
   }
-  if (total === 0) return "";
-  return Buffer.concat(chunks).toString("utf8").trim();
+  if (total === 0) {
+    if (encoding === "gzip") {
+      throw new ContextGraphError("Invalid gzip request body", "INVALID_GZIP", 400);
+    }
+    return "";
+  }
+  const rawBuf = Buffer.concat(chunks, total);
+  if (encoding === "gzip") {
+    try {
+      const decoded = gunzipSync(rawBuf, { maxOutputLength: MAX_BODY_BYTES });
+      return decoded.toString("utf8").trim();
+    } catch (err) {
+      const code =
+        err && typeof err === "object" && "code" in err
+          ? String((err as { code?: unknown }).code)
+          : "";
+      if (code === "ERR_BUFFER_TOO_LARGE") {
+        throw new ContextGraphError(
+          "Decompressed request body exceeds maximum size",
+          "PAYLOAD_TOO_LARGE",
+          413,
+        );
+      }
+      throw new ContextGraphError("Invalid gzip request body", "INVALID_GZIP", 400);
+    }
+  }
+  return rawBuf.toString("utf8").trim();
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -467,6 +508,48 @@ export function createContextGraphServer(
                   graphId,
                 })
               : undefined;
+
+          if (ingestOpts.responseMode === "slim") {
+            const slimPruned = pruned
+              ? {
+                  ...pruned,
+                  events: pruned.events.filter((ev, idx) => {
+                    const orig = events[idx];
+                    if (!orig) return true;
+                    return (
+                      ev.pruned === true ||
+                      ev.output !== orig.output ||
+                      ev.args !== orig.args
+                    );
+                  }),
+                }
+              : undefined;
+            const slimCompiled = compiled
+              ? {
+                  promptText: compiled.promptText,
+                  format: validatedCompileOpts?.format ?? "both",
+                  totalTokens: compiled.kvCache.totalTokens,
+                  budgetTokens: compiled.maxTokens,
+                }
+              : undefined;
+
+            sendJson(
+              res,
+              200,
+              {
+                ok: true,
+                graphId,
+                ingestedSummary: {
+                  ingestedCount: ingested.ingestedCount,
+                  skippedCount: ingested.skippedCount,
+                },
+                ...(slimPruned ? { pruned: slimPruned } : {}),
+                ...(slimCompiled ? { compiled: slimCompiled } : {}),
+              },
+              origin,
+            );
+            return;
+          }
 
           sendJson(
             res,

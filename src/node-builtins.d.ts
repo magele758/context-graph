@@ -164,6 +164,14 @@ declare module "node:http" {
   ): Server;
 }
 
+declare module "node:zlib" {
+  export interface ZlibOptions {
+    maxOutputLength?: number;
+  }
+  export function gzipSync(buf: Buffer | Uint8Array | string, options?: ZlibOptions): Buffer;
+  export function gunzipSync(buf: Buffer | Uint8Array | string, options?: ZlibOptions): Buffer;
+}
+
 declare module "node:test" {
   export interface TestContext {
     name: string;
